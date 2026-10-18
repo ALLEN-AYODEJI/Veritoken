@@ -171,6 +171,40 @@ fn test_max_holders_blocks_new_but_allows_existing() {
     assert!(ce.can_transfer(&h1, &h2, &1));
 }
 
+#[test]
+fn test_max_holders_final_slot_transition() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let last_holder = Address::generate(&env);
+    let excess_holder = Address::generate(&env);
+    for address in [&sender, &last_holder, &excess_holder] {
+        kyc.approve(&verifier, address, &1, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 0, 2, false));
+    ce.register_holder(&sender);
+    assert_eq!(ce.holder_count(), 1);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &last_holder, &1),
+        TransferDecision::Allow
+    );
+    // Evaluation is read-only; registration records the successful transfer's recipient.
+    assert_eq!(ce.holder_count(), 1);
+    ce.register_holder(&last_holder);
+    assert_eq!(ce.holder_count(), 2);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &excess_holder, &1),
+        TransferDecision::Deny(DenyReason::MaxHoldersReached)
+    );
+    assert!(!ce.lockup_status(&excess_holder).is_holder);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &last_holder, &1),
+        TransferDecision::Allow
+    );
+    ce.register_holder(&last_holder);
+    assert_eq!(ce.holder_count(), 2);
+}
+
 // ── Validation errors ─────────────────────────────────────────────────────────
 
 #[test]
@@ -909,7 +943,127 @@ fn test_tier_policy_exact_match_overrides_wildcard() {
     assert!(ce.can_transfer(&alice, &bob, &100));
 }
 
+#[test]
+fn test_tier_policy_amount_cap_boundaries() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    kyc.approve(&verifier, &sender, &1, &0, &String::from_str(&env, "US"));
+    kyc.approve(&verifier, &recipient, &2, &0, &String::from_str(&env, "US"));
+    ce.set_rules(&rules(1_000, 0, 0, false));
+    ce.set_tier_policy(
+        &1,
+        &2,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 100,
+            min_from_tier: 1,
+            min_to_tier: 2,
+        },
+    );
+    for (amount, expected) in [
+        (100, TransferDecision::Allow),
+        (101, TransferDecision::Deny(DenyReason::TierAmountExceeded)),
+    ] {
+        assert_eq!(ce.evaluate_transfer(&sender, &recipient, &amount), expected);
+        assert_eq!(
+            ce.evaluate_transfer(&recipient, &sender, &amount),
+            TransferDecision::Allow
+        );
+    }
+    assert_eq!(ce.tier_policy_count(), 1);
+    assert_eq!(ce.get_tier_policy(&1, &2).unwrap().max_transfer_amount, 100);
+    assert!(ce.get_tier_policy(&2, &1).is_none());
+}
+
+#[test]
+fn test_blocked_tier_policy_precedes_tier_amount_check() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    kyc.approve(&verifier, &sender, &1, &0, &String::from_str(&env, "US"));
+    kyc.approve(&verifier, &recipient, &2, &0, &String::from_str(&env, "US"));
+    ce.set_rules(&rules(1_000, 0, 0, false));
+    ce.set_tier_policy(
+        &1,
+        &2,
+        &TierPolicy {
+            blocked: true,
+            max_transfer_amount: 100,
+            min_from_tier: 1,
+            min_to_tier: 2,
+        },
+    );
+    for amount in [1, 100, 101] {
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &amount),
+            TransferDecision::Deny(DenyReason::TierPolicyBlocked)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&recipient, &sender, &amount),
+            TransferDecision::Allow
+        );
+    }
+}
+
 // ── Risk scoring tests (preserved) ───────────────────────────────────────────
+
+#[test]
+fn test_risk_default_score_boundaries_for_unscored_addresses() {
+    use crate::{DenyReason, RiskConfig, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let jurisdiction = String::from_str(&env, "US");
+    for address in [&sender, &recipient] {
+        kyc.approve(&verifier, address, &1, &0, &jurisdiction);
+    }
+    assert!(ce.get_jurisdiction_risk_score(&jurisdiction).is_none());
+    // The threshold may be below the default; only scores above 100 are invalid.
+    for (max_score, default_score) in [(50, 0), (50, 50), (50, 51), (100, 100)] {
+        ce.set_risk_config(&RiskConfig {
+            max_score,
+            default_score,
+        });
+        let stored = ce.get_risk_config().unwrap();
+        assert_eq!(stored.max_score, max_score);
+        assert_eq!(stored.default_score, default_score);
+        let denied = default_score > max_score;
+        assert_eq!(
+            ce.evaluate_transfer_risk(&jurisdiction, &jurisdiction),
+            (default_score, default_score, denied)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &1),
+            if denied {
+                TransferDecision::Deny(DenyReason::RiskScoreTooHigh)
+            } else {
+                TransferDecision::Allow
+            }
+        );
+    }
+    for (max_score, default_score) in [(100, 101), (101, 0)] {
+        assert_eq!(
+            ce.try_set_risk_config(&RiskConfig {
+                max_score,
+                default_score
+            }),
+            Err(Ok(Error::from(ComplianceError::InvalidRiskConfig)))
+        );
+        let stored = ce.get_risk_config().unwrap();
+        assert_eq!((stored.max_score, stored.default_score), (100, 100));
+        assert_eq!(
+            ce.evaluate_transfer_risk(&jurisdiction, &jurisdiction),
+            (100, 100, false)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &1),
+            TransferDecision::Allow
+        );
+    }
+}
 
 #[test]
 fn test_risk_scoring_inactive_by_default() {
