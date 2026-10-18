@@ -758,7 +758,7 @@ fn test_can_transfer_ignores_kyc_for_backward_compat() {
 }
 
 #[test]
-fn test_evaluate_transfer_amount_exceeded() {
+fn test_evaluate_transfer_maximum_is_inclusive() {
     use crate::{DenyReason, TransferDecision};
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
@@ -774,6 +774,11 @@ fn test_evaluate_transfer_amount_exceeded() {
         allowlist_mode: false,
         max_holding_period: 0,
     });
+    // The cap is inclusive; one smallest unit above it is denied.
+    assert_eq!(
+        ce.evaluate_transfer(&alice, &bob, &500),
+        TransferDecision::Allow
+    );
     assert_eq!(
         ce.evaluate_transfer(&alice, &bob, &501),
         TransferDecision::Deny(DenyReason::AmountExceeded)
@@ -1650,7 +1655,10 @@ fn test_deny_transfer_rejects_empty_reason() {
     );
 
     // Normal path: non-empty reason must succeed and emit a deny_xfr event.
-    let reason = String::from_str(&env, "blocklisted jurisdiction flagged by compliance officer");
+    let reason = String::from_str(
+        &env,
+        "blocklisted jurisdiction flagged by compliance officer",
+    );
     ce.deny_transfer(&from, &to, &100, &reason);
 }
 

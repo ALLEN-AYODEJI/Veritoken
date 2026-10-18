@@ -18,6 +18,19 @@ This document is the canonical reference for every public entry point, data stru
 **Crate:** `contracts/kyc-registry`  
 **Purpose:** On-chain registry of investor KYC approvals. Every token transfer calls `is_approved` on both parties before any balance changes.
 
+### Roles and authorization
+
+Admin membership and verifier membership are independent. An admin must also be added as a verifier to make ordinary subject-level decisions. A verifier cannot manage admin or verifier membership unless separately granted the admin role.
+
+| Capability | Existing methods | Caller requirement and authorization | Subject signature required? |
+|---|---|---|---|
+| Manage admins | `propose_admin`, `add_admin`, `remove_admin` | `caller.require_auth()` and `require_admin` membership check | No |
+| Accept proposed admin membership | `accept_admin` | Stored pending admin authorizes via `pending.require_auth()` | No |
+| Manage verifiers | `add_verifier`, `remove_verifier` | `caller.require_auth()` and `require_admin` | No |
+| Approve, renew (including clearing expiry), reject, revoke, or update a subject's tier | `approve`, `approve_batch`, `reject`, `revoke`, `revoke_batch`, `update_tier` | `verifier.require_auth()` and `require_verifier` membership check | No |
+| Revoke approvals associated with a verifier | `revoke_all_by_verifier` | `caller.require_auth()` and `require_admin` | No |
+| Read a full subject record | `get_full_record(requester, subject)` | `requester.require_auth()`; requester must be the subject or an admin | Yes when requester is the subject; no for an admin requester |
+
 ### Data structures
 
 #### `KycRecord`
@@ -106,7 +119,7 @@ verifier_count(env) → u32
 verifier_list_pub(env) → Vec<Address>
 get_verifiers(env, start: u32, limit: u32) → Vec<Address>   // limit capped at 20
 ```
-Admin-only. Only addresses in the verifier list may call KYC write methods.
+Only `add_verifier` and `remove_verifier` are admin-only; the verifier listing and count queries require no authorization. Ordinary KYC write methods require verifier membership.
 
 ---
 
@@ -132,9 +145,9 @@ get_tier(env, addr: Address) → u32
 get_subjects_by_verifier(env, verifier: Address, start: u32, limit: u32) → Vec<Address>
 get_lifecycle_history(env, subject: Address, start: u32, limit: u32) → Vec<KycTransition>
 lifecycle_count(env, subject: Address) → u32
-get_expiring_records(env, before_timestamp: u64, limit: u32) → Vec<ExpiringRecord>
+get_expiring_soon(env, within_seconds: u64, start: u32, limit: u32) → Vec<ExpiringRecord>
 get_verifier_log(env, start: u32, limit: u32) → Vec<VerifierLogEntry>
-get_full_record(env, subject: Address) → KycFullRecord
+get_full_record(env, requester: Address, subject: Address) → KycFullRecord
 ```
 
 ---

@@ -2177,3 +2177,109 @@ fn test_verifier_log_rejects_duplicate_subject_entry() {
     );
     assert_eq!(client.verifier_log_count(), 1);
 }
+
+#[test]
+fn test_expiry_scan_tracks_renewal_and_clearing() {
+    let (env, client, admin) = setup();
+    env.ledger().set_timestamp(0);
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+    let first_expiry = 86_400 * 2;
+    let renewed_expiry = 86_400 * 5;
+    client.approve(&verifier, &subject, &0, &first_expiry, &js(&env, "US"));
+    let initial = client.get_expiring_soon(&renewed_expiry, &0, &50);
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial.get(0).unwrap().addr, subject);
+    assert_eq!(initial.get(0).unwrap().record.expiry, first_expiry);
+
+    client.approve(&verifier, &subject, &0, &renewed_expiry, &js(&env, "US"));
+    assert!(client.get_expiring_soon(&first_expiry, &0, &50).is_empty());
+    // Scan both buckets: the renewed expiry must be returned exactly once.
+    let renewed = client.get_expiring_soon(&renewed_expiry, &0, &50);
+    assert_eq!(renewed.len(), 1);
+    assert_eq!(renewed.get(0).unwrap().addr, subject);
+    assert_eq!(renewed.get(0).unwrap().record.expiry, renewed_expiry);
+    assert!(client
+        .get_expiring_soon(&renewed_expiry, &1, &50)
+        .is_empty());
+
+    client.approve(&verifier, &subject, &0, &0, &js(&env, "US"));
+    assert!(client
+        .get_expiring_soon(&renewed_expiry, &0, &50)
+        .is_empty());
+    assert_eq!(client.get_record(&subject).expiry, 0);
+    assert!(client.is_approved(&subject));
+}
+
+#[test]
+fn test_compact_expiry_buckets_resumes_to_single_call_result() {
+    let (env, client, admin) = setup();
+    env.ledger().set_timestamp(0);
+    let other_id = env.register(KycRegistry, ());
+    let single = KycRegistryClient::new(&env, &other_id);
+    single.initialize(&admin);
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+    single.add_verifier(&admin, &verifier);
+    let days = [1u32, 3, 5, 10];
+    let future = Address::generate(&env);
+    for day in days {
+        let subject = if day == 10 {
+            future.clone()
+        } else {
+            Address::generate(&env)
+        };
+        for registry in [&client, &single] {
+            registry.approve(
+                &verifier,
+                &subject,
+                &0,
+                &(86_400 * day as u64),
+                &js(&env, "US"),
+            );
+        }
+    }
+    env.ledger().set_timestamp(86_400 * 6);
+    single.compact_expiry_buckets(&admin, &6, &100);
+    let cursor = |id: &Address| {
+        env.as_contract(id, || {
+            env.storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::EarliestBucketDay)
+                .unwrap()
+        })
+    };
+    let bucket = |id: &Address, day: u32| {
+        env.as_contract(id, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Vec<Address>>(&DataKey::ExpiryBucket(day))
+        })
+    };
+    let mut previous_cursor = 0;
+    // Sparse days force resumption across empty days as well as populated buckets.
+    for (call, expected_cursor) in [2u32, 4, 6].iter().enumerate() {
+        client.compact_expiry_buckets(&admin, &6, &1);
+        assert_eq!(cursor(&client.address), *expected_cursor);
+        assert!(cursor(&client.address) > previous_cursor);
+        previous_cursor = cursor(&client.address);
+        for (index, day) in days.iter().enumerate() {
+            assert_eq!(bucket(&client.address, *day).is_some(), index > call);
+        }
+        let expiring = client.get_expiring_soon(&(86_400 * 5), &0, &50);
+        assert_eq!(expiring.len(), 1);
+        assert_eq!(expiring.get(0).unwrap().addr, future);
+        assert_eq!(expiring.get(0).unwrap().record.expiry, 86_400 * 10);
+    }
+    for day in 0u32..=10 {
+        assert_eq!(bucket(&client.address, day), bucket(&single.address, day));
+    }
+    assert_eq!(cursor(&client.address), cursor(&single.address));
+    assert!(
+        client.get_expiring_soon(&(86_400 * 5), &0, &50)
+            == single.get_expiring_soon(&(86_400 * 5), &0, &50)
+    );
+    client.compact_expiry_buckets(&admin, &6, &1);
+    assert_eq!(cursor(&client.address), 6);
+}
