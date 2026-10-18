@@ -649,6 +649,169 @@ fn test_activate_rules_one_second_before_boundary_fails() {
 // ── evaluate_transfer / KYC integration (preserved + extended) ────────────────
 
 #[test]
+fn test_evaluate_transfer_min_holding_period_boundary() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 10, 0, false));
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&from);
+
+    // The minimum release timestamp is inclusive: transfers unlock at equality.
+    for (timestamp, expected) in [
+        (
+            1_009,
+            TransferDecision::Deny(DenyReason::HoldingPeriodNotMet),
+        ),
+        (1_010, TransferDecision::Allow),
+        (1_011, TransferDecision::Allow),
+    ] {
+        env.ledger().set_timestamp(timestamp);
+        assert_eq!(ce.evaluate_transfer(&from, &to, &1), expected);
+        let status = ce.lockup_status(&from);
+        assert_eq!(status.holder_since, 1_000);
+        assert_eq!(status.min_release_at, 1_010);
+        assert_eq!(status.locked, timestamp < 1_010);
+        assert_eq!(
+            status.seconds_until_unlock,
+            1_010u64.saturating_sub(timestamp)
+        );
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_zero_min_holding_period_allows_immediately() {
+    use crate::TransferDecision;
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 0, 0, false));
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&from);
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Allow
+    );
+    let status = ce.lockup_status(&from);
+    assert_eq!(status.min_release_at, 0);
+    assert!(!status.locked);
+    assert_eq!(status.seconds_until_unlock, 0);
+}
+
+#[test]
+fn test_evaluate_transfer_max_holding_period_boundary() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    let mut configured = rules(0, 0, 0, false);
+    configured.max_holding_period = 10;
+    ce.set_rules(&configured);
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&to);
+
+    // The existing maximum policy rejects incoming transfers at and after
+    // the recipient's deadline; it does not impose a minimum lock.
+    for (timestamp, expected) in [
+        (1_009, TransferDecision::Allow),
+        (
+            1_010,
+            TransferDecision::Deny(DenyReason::RecipientHoldingPeriodExceeded),
+        ),
+        (
+            1_011,
+            TransferDecision::Deny(DenyReason::RecipientHoldingPeriodExceeded),
+        ),
+    ] {
+        env.ledger().set_timestamp(timestamp);
+        assert_eq!(ce.evaluate_transfer(&from, &to, &1), expected);
+        let status = ce.lockup_status(&to);
+        assert!(status.is_holder);
+        assert_eq!(status.holder_since, 1_000);
+        assert_eq!(status.min_holding_period, 0);
+        assert_eq!(status.max_holding_period, 10);
+        assert_eq!(status.min_release_at, 0);
+        assert_eq!(status.max_release_at, 1_010);
+        assert!(!status.locked);
+        assert_eq!(status.seconds_until_unlock, 0);
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_allowlist_endpoint_combinations() {
+    use crate::{DenyReason, TransferDecision};
+    for (allow_from, allow_to, expected) in [
+        (
+            false,
+            false,
+            TransferDecision::Deny(DenyReason::FromNotAllowlisted),
+        ),
+        (
+            true,
+            false,
+            TransferDecision::Deny(DenyReason::ToNotAllowlisted),
+        ),
+        (
+            false,
+            true,
+            TransferDecision::Deny(DenyReason::FromNotAllowlisted),
+        ),
+        (true, true, TransferDecision::Allow),
+    ] {
+        let (env, ce, kyc, verifier, _) = setup_with_kyc();
+        let from = Address::generate(&env);
+        let to = Address::generate(&env);
+        for address in [&from, &to] {
+            kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+        }
+        let mut configured = rules(0, 0, 0, false);
+        configured.allowlist_mode = true;
+        ce.set_rules(&configured);
+        if allow_from {
+            ce.add_to_allowlist(&from);
+        }
+        if allow_to {
+            ce.add_to_allowlist(&to);
+        }
+        assert_eq!(
+            ce.evaluate_transfer(&from, &to, &1),
+            expected,
+            "sender allowed: {allow_from}, recipient allowed: {allow_to}"
+        );
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_blocklisted_to_denied() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Allow
+    );
+    ce.add_to_blocklist(&to);
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Deny(DenyReason::ToBlocklisted)
+    );
+}
+
+#[test]
 fn test_evaluate_transfer_approved_kyc_allow() {
     use crate::TransferDecision;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
