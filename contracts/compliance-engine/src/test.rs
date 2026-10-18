@@ -14,6 +14,10 @@ use soroban_sdk::{
 // ── Shared setup helpers ──────────────────────────────────────────────────────
 
 fn setup() -> (Env, ComplianceEngineClient<'static>, Address) {
+    setup_with_delay(0)
+}
+
+fn setup_with_delay(delay: u64) -> (Env, ComplianceEngineClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
@@ -21,7 +25,7 @@ fn setup() -> (Env, ComplianceEngineClient<'static>, Address) {
     KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
     let ce_id = env.register(ComplianceEngine, ());
     let ce = ComplianceEngineClient::new(&env, &ce_id);
-    ce.initialize(&admin, &kyc_id, &0u64);
+    ce.initialize(&admin, &kyc_id, &delay);
     (env, ce, admin)
 }
 
@@ -1350,9 +1354,10 @@ fn test_migration_v2_records_migration_audit_entry() {
 fn test_blocklist_and_allowlist_independent() {
     let (env, ce, _) = setup();
     let addr = Address::generate(&env);
-    ce.add_to_blocklist(&addr);
+    // Allowlist first: adding an already-blocklisted address is rejected.
     ce.add_to_allowlist(&addr);
-    // Same address can be in both lists simultaneously
+    ce.add_to_blocklist(&addr);
+    // A subsequent blocklist entry does not remove the allowlist entry.
     assert!(ce.is_blocklisted(&addr));
     assert!(ce.is_allowlisted(&addr));
     ce.remove_from_blocklist(&addr);
@@ -1687,4 +1692,178 @@ fn test_append_policy_record_rejects_empty_comment() {
     assert_eq!(ce.policy_version_count(), before + 1);
     let record = ce.get_current_policy_version();
     assert_eq!(record.description, comment);
+}
+
+// #911: both endpoint orderings must produce the same mismatch reason.
+#[test]
+fn test_same_jurisdiction_symmetry() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let us = Address::generate(&env);
+    let gb = Address::generate(&env);
+    let other_us = Address::generate(&env);
+    for (address, jurisdiction) in [(&us, "US"), (&gb, "GB"), (&other_us, "US")] {
+        kyc.approve(
+            &verifier,
+            address,
+            &1,
+            &0,
+            &String::from_str(&env, jurisdiction),
+        );
+    }
+    let mut policy = rules(0, 0, 0, false);
+    policy.require_same_jurisdiction = true;
+    ce.set_rules(&policy);
+    for (from, to) in [(&us, &gb), (&gb, &us)] {
+        assert_eq!(
+            ce.evaluate_transfer(from, to, &100),
+            TransferDecision::Deny(DenyReason::SameJurisdictionRequired)
+        );
+        assert!(!ce.can_transfer(from, to, &100));
+    }
+    for (from, to) in [(&us, &other_us), (&other_us, &us)] {
+        assert_eq!(
+            ce.evaluate_transfer(from, to, &100),
+            TransferDecision::Allow
+        );
+        assert!(ce.can_transfer(from, to, &100));
+    }
+}
+
+// #912: use a nonzero delay and the same proposal on both sides of the boundary.
+#[test]
+fn test_delayed_activation_before_and_at_deadline() {
+    let (env, ce, _) = setup_with_delay(10);
+    env.ledger().set_timestamp(1_000);
+    let original = ce.get_rules();
+    let history = ce.get_policy_history(&0, &20);
+    let proposed = rules(100, 0, 0, false);
+    let description = String::from_str(&env, "set transfer cap");
+    ce.propose_rules(&proposed, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    assert_eq!(pending.activate_at, 1_010);
+    env.ledger().set_timestamp(pending.activate_at - 1);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::TooEarlyToActivate)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.policy_version_count(), history.len());
+    let retained = ce.get_pending_proposal().unwrap();
+    assert_eq!(retained.rules, proposed);
+    assert_eq!(retained.description, description);
+    assert_eq!(retained.activate_at, pending.activate_at);
+    env.ledger().set_timestamp(pending.activate_at);
+    assert_eq!(ce.try_activate_rules(), Ok(Ok(())));
+    assert_eq!(ce.get_rules(), proposed);
+    assert!(ce.get_pending_proposal().is_none());
+    let updated = ce.get_policy_history(&0, &20);
+    assert_eq!(updated.len(), history.len() + 1);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    assert_eq!(updated.get(0), history.get(0));
+    let record = updated.last().unwrap();
+    assert_eq!(record.version, history.len());
+    assert_eq!(record.rules, proposed);
+    assert_eq!(record.description, description);
+    assert_eq!(record.activation_timestamp, pending.activate_at);
+    assert_eq!(record.change_kind, PolicyChangeKind::DelayedRuleActivation);
+}
+
+// #913: a replacement must reset the deadline and remove the stale proposal.
+#[test]
+fn test_replacement_proposal_activates_only_latest() {
+    let (env, ce, _) = setup_with_delay(10);
+    let original = ce.get_rules();
+    let history = ce.get_policy_history(&0, &20);
+    env.ledger().set_timestamp(1_000);
+    ce.propose_rules(&rules(100, 0, 0, false), &String::from_str(&env, "first"));
+    let first_deadline = ce.get_pending_proposal().unwrap().activate_at;
+    env.ledger().set_timestamp(1_005);
+    let latest = rules(200, 60, 0, false);
+    let description = String::from_str(&env, "corrected policy");
+    ce.propose_rules(&latest, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    assert_eq!(pending.rules, latest);
+    assert_eq!(pending.description, description);
+    assert_eq!(pending.activate_at, 1_015);
+    env.ledger().set_timestamp(first_deadline);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::TooEarlyToActivate)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.get_pending_proposal().unwrap().rules, latest);
+    env.ledger().set_timestamp(pending.activate_at);
+    ce.activate_rules();
+    assert_eq!(ce.get_rules(), latest);
+    assert!(ce.get_pending_proposal().is_none());
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    let record = ce.get_current_policy_version();
+    assert_eq!(record.rules, latest);
+    assert_eq!(record.description, description);
+    assert_eq!(record.activation_timestamp, pending.activate_at);
+    assert_eq!(record.change_kind, PolicyChangeKind::DelayedRuleActivation);
+    let activated_history = ce.get_policy_history(&0, &20);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::NoRulesPending)))
+    );
+    assert_eq!(ce.get_policy_history(&0, &20), activated_history);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+}
+
+// #914: caller-supplied audit text occurs in these four public mutation paths.
+// deny_transfer uses an evaluation reason; migrate_schema has a separate audit log.
+#[test]
+fn test_empty_governance_descriptions_preserve_state() {
+    let (env, ce, _) = setup_with_delay(10);
+    let original = ce.get_rules();
+    let description = String::from_str(&env, "approved policy");
+    let proposed = rules(200, 0, 0, false);
+    ce.propose_rules(&proposed, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    let history = ce.get_policy_history(&0, &20);
+    let empty = String::from_str(&env, "");
+    assert_eq!(
+        ce.try_propose_rules(&rules(300, 0, 0, false), &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    assert_eq!(
+        ce.try_append_policy_record(&empty),
+        Err(Ok(Error::from(ComplianceError::EmptyGovernanceComment)))
+    );
+    assert_eq!(
+        ce.try_migrate_schema(&2, &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    assert_eq!(
+        ce.try_deny_transfer(&from, &to, &1, &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyEvaluationReason)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.policy_version_count(), history.len());
+    assert_eq!(ce.schema_version(), 1);
+    assert_eq!(ce.migration_count(), 0);
+    let retained = ce.get_pending_proposal().unwrap();
+    assert_eq!(retained.rules, pending.rules);
+    assert_eq!(retained.description, pending.description);
+    assert_eq!(retained.activate_at, pending.activate_at);
+    ce.append_policy_record(&description);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    assert_eq!(ce.get_current_policy_version().description, description);
+    ce.migrate_schema(&2, &description);
+    assert_eq!(ce.schema_version(), 2);
+    assert_eq!(ce.migration_count(), 1);
+    assert_eq!(ce.get_migration_record(&0).description, description);
+    ce.deny_transfer(&from, &to, &1, &description);
+    env.ledger().set_timestamp(pending.activate_at);
+    ce.activate_rules();
+    assert_eq!(ce.get_rules(), proposed);
+    assert_eq!(ce.policy_version_count(), history.len() + 2);
+    assert_eq!(ce.get_current_policy_version().description, description);
 }

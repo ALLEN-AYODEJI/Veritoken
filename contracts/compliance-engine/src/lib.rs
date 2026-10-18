@@ -76,7 +76,7 @@ pub enum ComplianceError {
     /// `max_transfer_amount` is negative.  A negative cap is nonsensical and
     /// would silently bypass the amount check inside `evaluate_transfer_inner`.
     NegativeTierTransferAmount = 12,
-    /// Returned when `propose_rules` is called with an empty description
+    /// Returned when `propose_rules` or `migrate_schema` receives an empty description
     /// string.  Every governance proposal must carry a human-readable reason
     /// so the policy audit trail remains meaningful.
     EmptyDescription = 13,
@@ -1192,9 +1192,7 @@ impl ComplianceEngine {
         }
         let key = DataKey::HolderSince(addr.clone());
         let is_new = !env.storage().persistent().has(&key);
-        env.storage()
-            .persistent()
-            .set(&key, &(holder_since as u64));
+        env.storage().persistent().set(&key, &(holder_since as u64));
         env.storage().persistent().extend_ttl(&key, THRESHOLD, BUMP);
         if is_new {
             let c: u32 = env
@@ -1516,8 +1514,11 @@ impl ComplianceEngine {
     }
 
     pub fn migrate_schema(env: Env, to_version: u32, description: String) {
-        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         Self::require_admin(&env);
+        if description.is_empty() {
+            panic_with_error!(env, ComplianceError::EmptyDescription);
+        }
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let current: u32 = env
             .storage()
             .instance()
