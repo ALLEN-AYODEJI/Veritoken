@@ -2177,3 +2177,260 @@ fn test_verifier_log_rejects_duplicate_subject_entry() {
     );
     assert_eq!(client.verifier_log_count(), 1);
 }
+
+// ── Per-subject history isolation ─────────────────────────────────────────────
+
+/// Two subjects accumulate transitions in an interleaved order.  Each subject's
+/// history query must return only its own events, with its own sequence starting
+/// at 0 — regardless of the global order in which transitions were recorded.
+#[test]
+fn test_interleaved_transitions_are_isolated_per_subject() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject_a = Address::generate(&env);
+    let subject_b = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // Interleave: A approve → B approve → A revoke → B update_tier → A approve
+    client.approve(&verifier, &subject_a, &1, &0, &js(&env, "US")); // A seq 0
+    client.approve(&verifier, &subject_b, &2, &0, &js(&env, "DE")); // B seq 0
+    client.revoke(&verifier, &subject_a);                            // A seq 1
+    client.update_tier(&verifier, &subject_b, &1);                  // B seq 1
+    client.approve(&verifier, &subject_a, &2, &0, &js(&env, "GB")); // A seq 2
+
+    // ── Subject A: 3 transitions, own sequence ────────────────────────────────
+    assert_eq!(client.get_lifecycle_count(&subject_a), 3);
+    let hist_a = client.get_lifecycle_history(&subject_a, &0, &10);
+    assert_eq!(hist_a.len(), 3);
+
+    // seq 0 — Approve, verifier, tier 1, jurisdiction "US"
+    let a0 = hist_a.get(0).unwrap();
+    assert_eq!(a0.seq, 0);
+    assert_eq!(a0.kind, KycTransitionKind::Approve);
+    assert_eq!(a0.verifier, verifier);
+    assert_eq!(a0.tier, 1);
+    assert_eq!(a0.jurisdiction, js(&env, "US"));
+
+    // seq 1 — Revoke
+    let a1 = hist_a.get(1).unwrap();
+    assert_eq!(a1.seq, 1);
+    assert_eq!(a1.kind, KycTransitionKind::Revoke);
+    assert_eq!(a1.verifier, verifier);
+
+    // seq 2 — Re-approve with tier 2, jurisdiction "GB"
+    let a2 = hist_a.get(2).unwrap();
+    assert_eq!(a2.seq, 2);
+    assert_eq!(a2.kind, KycTransitionKind::Approve);
+    assert_eq!(a2.tier, 2);
+    assert_eq!(a2.jurisdiction, js(&env, "GB"));
+
+    // ── Subject B: 2 transitions, own sequence starting at 0 ──────────────────
+    assert_eq!(client.get_lifecycle_count(&subject_b), 2);
+    let hist_b = client.get_lifecycle_history(&subject_b, &0, &10);
+    assert_eq!(hist_b.len(), 2);
+
+    // seq 0 — Approve, tier 2, jurisdiction "DE"
+    let b0 = hist_b.get(0).unwrap();
+    assert_eq!(b0.seq, 0);
+    assert_eq!(b0.kind, KycTransitionKind::Approve);
+    assert_eq!(b0.verifier, verifier);
+    assert_eq!(b0.tier, 2);
+    assert_eq!(b0.jurisdiction, js(&env, "DE"));
+
+    // seq 1 — TierUpdate to tier 1
+    let b1 = hist_b.get(1).unwrap();
+    assert_eq!(b1.seq, 1);
+    assert_eq!(b1.kind, KycTransitionKind::TierUpdate);
+    assert_eq!(b1.tier, 1);
+
+    // ── Cross-subject: no bleed — B's history contains no entries from A ───────
+    // All entries in B's history belong to subject_b by key construction; verifying
+    // the count ensures no A entries were inserted under B's subject key.
+    for i in 0..hist_b.len() {
+        assert_ne!(
+            hist_b.get(i).unwrap().kind,
+            KycTransitionKind::Revoke,
+            "subject_b history must not contain subject_a's Revoke at position {i}"
+        );
+    }
+}
+
+// ── Tier validation boundary cases ────────────────────────────────────────────
+
+/// `approve` itself does not validate the tier value — any u32 is accepted and
+/// stored as-is (no tier guard in the approve path).  The meaningful guarded
+/// entry points are `update_tier` (rejects new_tier > 2 with InvalidTier) and
+/// `revoke` (rejects record.tier > 2 with InvalidRevokeTier).
+///
+/// This test covers:
+///   • The smallest invalid tier for update_tier  → 3  (InvalidTier)
+///   • A value clearly above the highest tier     → u32::MAX (InvalidTier)
+///   • Valid boundary tiers 0, 1, 2 are accepted without error
+///   • No storage mutation occurs after a rejected update_tier call
+#[test]
+fn test_tier_validation_boundary_cases() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // ── update_tier: smallest invalid tier = 3 ────────────────────────────────
+    let subject = Address::generate(&env);
+    client.approve(&verifier, &subject, &2, &0, &js(&env, "US"));
+
+    let res = client.try_update_tier(&verifier, &subject, &3);
+    assert_eq!(
+        res,
+        Err(Ok(Error::from(KycError::InvalidTier))),
+        "tier 3 (one above the max of 2) must be rejected with InvalidTier"
+    );
+    // No state change: record still holds tier 2, history count unchanged
+    assert_eq!(client.get_record(&subject).tier, 2);
+    assert_eq!(client.get_lifecycle_count(&subject), 1);
+
+    // ── update_tier: well above highest tier ──────────────────────────────────
+    let res_max = client.try_update_tier(&verifier, &subject, &u32::MAX);
+    assert_eq!(
+        res_max,
+        Err(Ok(Error::from(KycError::InvalidTier))),
+        "u32::MAX must also be rejected with InvalidTier"
+    );
+    // Still no mutation
+    assert_eq!(client.get_record(&subject).tier, 2);
+    assert_eq!(client.get_lifecycle_count(&subject), 1);
+
+    // ── update_tier: valid boundary tiers 0, 1, 2 are all accepted ───────────
+    for valid_tier in [0u32, 1, 2] {
+        // Re-approve to reset to Approved status before each update
+        client.approve(&verifier, &subject, &0, &0, &js(&env, "US"));
+        client.update_tier(&verifier, &subject, &valid_tier);
+        assert_eq!(
+            client.get_record(&subject).tier,
+            valid_tier,
+            "tier {valid_tier} should be accepted as a valid boundary value"
+        );
+    }
+}
+
+/// `approve` does not impose a tier ceiling; the tier guard lives in
+/// `update_tier` and `revoke`.  Verifying that `revoke` rejects a record whose
+/// tier exceeds 2 confirms the guard fires at the correct entry point.
+#[test]
+fn test_approve_stores_tier_above_max_and_revoke_rejects_it() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // approve accepts tier=3 without error (no guard in approve path)
+    client.approve(&verifier, &subject, &3, &0, &js(&env, "US"));
+    assert!(client.is_approved(&subject));
+    assert_eq!(client.get_record(&subject).tier, 3);
+
+    // revoke rejects the record because record.tier > 2
+    let res = client.try_revoke(&verifier, &subject);
+    assert_eq!(
+        res,
+        Err(Ok(Error::from(KycError::InvalidRevokeTier))),
+        "revoke must return InvalidRevokeTier when the stored tier exceeds 2"
+    );
+    // Record unchanged — still Approved with tier 3
+    assert!(client.is_approved(&subject));
+    assert_eq!(client.get_record(&subject).tier, 3);
+}
+
+// ── Zero-expiry sentinel ──────────────────────────────────────────────────────
+
+/// A KYC record with expiry = 0 means "no expiry".  After a substantial time
+/// advance the subject must still be approved and the stored expiry must remain 0.
+#[test]
+fn test_zero_expiry_subject_remains_approved_after_time_advance() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // Approve at an arbitrary starting time with expiry = 0
+    env.ledger().set_timestamp(1_000);
+    client.approve(&verifier, &subject, &1, &0, &js(&env, "US"));
+
+    // Advance by a large interval (≈ 10 years in seconds)
+    env.ledger().set_timestamp(1_000 + 10 * 365 * 24 * 3600);
+
+    // Subject must still be approved — expiry = 0 is the "never expires" sentinel
+    assert!(
+        client.is_approved(&subject),
+        "zero-expiry subject must remain approved after time advances"
+    );
+
+    // The stored record must preserve expiry = 0 (no mutation from time check)
+    let record = client.get_record(&subject);
+    assert_eq!(
+        record.expiry, 0,
+        "expiry field must remain 0 after time advances"
+    );
+    assert!(matches!(record.status, KycStatus::Approved));
+}
+
+// ── Expiry boundary semantics ─────────────────────────────────────────────────
+
+/// Pins down the exact boundary convention for nonzero expiry:
+///   • timestamp <  expiry  →  approved  (strictly before expiry)
+///   • timestamp == expiry  →  expired   (is_approved condition: expiry <= now)
+///   • timestamp >  expiry  →  expired
+///
+/// The production check is: `expiry != 0 && expiry <= env.ledger().timestamp()`
+/// returns false (expired).  This test documents and regresses that convention.
+#[test]
+fn test_expiry_boundary_one_second_before_at_and_after() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    const EXPIRY: u64 = 5_000;
+
+    // Approve while ledger is before the expiry so validate_expiry passes
+    env.ledger().set_timestamp(EXPIRY - 1);
+    client.approve(&verifier, &subject, &1, &EXPIRY, &js(&env, "US"));
+
+    // ── One second BEFORE expiry: subject is approved ─────────────────────────
+    // timestamp = EXPIRY - 1; condition: expiry <= now → 5000 <= 4999 → false → approved
+    assert!(
+        client.is_approved(&subject),
+        "subject must be approved one second before expiry (timestamp {} < expiry {})",
+        EXPIRY - 1,
+        EXPIRY
+    );
+
+    // ── AT the exact expiry second: subject is expired ────────────────────────
+    // timestamp = EXPIRY; condition: expiry <= now → 5000 <= 5000 → true → NOT approved
+    env.ledger().set_timestamp(EXPIRY);
+    assert!(
+        !client.is_approved(&subject),
+        "subject must NOT be approved at the exact expiry second (timestamp {} == expiry {})",
+        EXPIRY,
+        EXPIRY
+    );
+
+    // ── One second AFTER expiry: subject is still expired ─────────────────────
+    // timestamp = EXPIRY + 1; condition: expiry <= now → 5000 <= 5001 → true → NOT approved
+    env.ledger().set_timestamp(EXPIRY + 1);
+    assert!(
+        !client.is_approved(&subject),
+        "subject must NOT be approved one second after expiry (timestamp {} > expiry {})",
+        EXPIRY + 1,
+        EXPIRY
+    );
+
+    // ── The stored record is unmodified across all three checks ───────────────
+    // is_approved is a pure read; it must never mutate the stored record
+    let record = client.get_record(&subject);
+    assert_eq!(
+        record.expiry, EXPIRY,
+        "stored expiry must be unchanged after boundary queries"
+    );
+    assert!(
+        matches!(record.status, KycStatus::Approved),
+        "stored status must remain Approved (expiry is evaluated at query time)"
+    );
+}
