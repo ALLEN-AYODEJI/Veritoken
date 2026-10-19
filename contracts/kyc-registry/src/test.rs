@@ -2371,6 +2371,550 @@ fn test_zero_expiry_subject_remains_approved_after_time_advance() {
     assert!(matches!(record.status, KycStatus::Approved));
 }
 
+// ── Jurisdiction validation: invalid cases with no-mutation checks ────────────
+
+/// Empty jurisdiction on `approve` returns `InvalidJurisdiction`, leaves no
+/// record and no lifecycle entry.
+#[test]
+fn test_approve_empty_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let res = client.try_approve(&verifier, &subject, &1, &0, &js(&env, ""));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    // No record written.
+    assert!(client.get_record_opt(&subject).is_none());
+    // No lifecycle entry written.
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    assert_eq!(client.get_lifecycle_history(&subject, &0, &10).len(), 0);
+}
+
+/// Single-character jurisdiction on `approve` returns `InvalidJurisdiction`,
+/// leaves no record and no lifecycle entry.
+#[test]
+fn test_approve_single_char_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let res = client.try_approve(&verifier, &subject, &0, &0, &js(&env, "U"));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    assert!(client.get_record_opt(&subject).is_none());
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    assert_eq!(client.get_lifecycle_history(&subject, &0, &10).len(), 0);
+}
+
+/// Three-character jurisdiction on `approve` returns `InvalidJurisdiction`,
+/// leaves no record and no lifecycle entry.
+#[test]
+fn test_approve_three_char_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let res = client.try_approve(&verifier, &subject, &0, &0, &js(&env, "USA"));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    assert!(client.get_record_opt(&subject).is_none());
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    assert_eq!(client.get_lifecycle_history(&subject, &0, &10).len(), 0);
+}
+
+/// Lowercase jurisdiction on `approve` returns `InvalidJurisdiction`, leaves no
+/// record and no lifecycle entry.
+#[test]
+fn test_approve_lowercase_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let res = client.try_approve(&verifier, &subject, &0, &0, &js(&env, "us"));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    assert!(client.get_record_opt(&subject).is_none());
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    assert_eq!(client.get_lifecycle_history(&subject, &0, &10).len(), 0);
+}
+
+/// Digit-containing jurisdiction on `approve` returns `InvalidJurisdiction`,
+/// leaves no record and no lifecycle entry.
+#[test]
+fn test_approve_digit_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let res = client.try_approve(&verifier, &subject, &0, &0, &js(&env, "U1"));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    assert!(client.get_record_opt(&subject).is_none());
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    assert_eq!(client.get_lifecycle_history(&subject, &0, &10).len(), 0);
+}
+
+/// Invalid jurisdiction on a *re-approve* (subject already has a record) does not
+/// overwrite the existing record and does not append a new lifecycle entry.
+#[test]
+fn test_approve_invalid_jurisdiction_does_not_overwrite_existing_record() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    // First approval succeeds.
+    client.approve(&verifier, &subject, &1, &0, &js(&env, "US"));
+    assert_eq!(client.get_lifecycle_count(&subject), 1);
+
+    // Attempt re-approve with invalid jurisdiction.
+    let res = client.try_approve(&verifier, &subject, &2, &0, &js(&env, "xx"));
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    // Record unchanged: still tier 1, jurisdiction "US".
+    let record = client.get_record(&subject);
+    assert_eq!(record.tier, 1);
+    assert_eq!(record.jurisdiction, js(&env, "US"));
+    // No new lifecycle entry was written.
+    assert_eq!(client.get_lifecycle_count(&subject), 1);
+}
+
+/// Valid two-uppercase-letter jurisdiction on `approve` succeeds and follows the
+/// standard lifecycle path.
+#[test]
+fn test_approve_valid_jurisdiction_follows_standard_lifecycle() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    client.approve(&verifier, &subject, &1, &0, &js(&env, "JP"));
+
+    assert!(client.is_approved(&subject));
+    let record = client.get_record(&subject);
+    assert_eq!(record.jurisdiction, js(&env, "JP"));
+    assert_eq!(record.tier, 1);
+
+    assert_eq!(client.get_lifecycle_count(&subject), 1);
+    let hist = client.get_lifecycle_history(&subject, &0, &1);
+    assert_eq!(hist.get(0).unwrap().kind, KycTransitionKind::Approve);
+    assert_eq!(hist.get(0).unwrap().jurisdiction, js(&env, "JP"));
+}
+
+/// Invalid jurisdiction in `approve_batch` is rejected with `InvalidJurisdiction`.
+/// No records and no lifecycle entries are written for any subject in the batch
+/// (atomic rollback).
+#[test]
+fn test_approve_batch_invalid_jurisdiction_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let mut subjects = Vec::new(&env);
+    // s1 has valid jurisdiction; s2 has invalid (empty).
+    subjects.push_back((s1.clone(), 0u32, 0u64, js(&env, "US")));
+    subjects.push_back((s2.clone(), 1u32, 0u64, js(&env, "")));
+
+    let res = client.try_approve_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    // The contract aborts (panics) when it hits s2's invalid jurisdiction.
+    // In Soroban the entire transaction is rolled back atomically on panic,
+    // so neither s1 nor s2 should have a record or lifecycle entry.
+    assert!(client.get_record_opt(&s1).is_none());
+    assert_eq!(client.get_lifecycle_count(&s1), 0);
+    assert!(client.get_record_opt(&s2).is_none());
+    assert_eq!(client.get_lifecycle_count(&s2), 0);
+    assert_eq!(client.get_lifecycle_history(&s2, &0, &10).len(), 0);
+}
+
+/// A batch where the FIRST entry has an invalid jurisdiction is rejected before
+/// any subject is written.
+#[test]
+fn test_approve_batch_invalid_jurisdiction_first_entry_no_mutation() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let mut subjects = Vec::new(&env);
+    // First entry is invalid — abort before touching s2.
+    subjects.push_back((s1.clone(), 0u32, 0u64, js(&env, "1A")));
+    subjects.push_back((s2.clone(), 0u32, 0u64, js(&env, "US")));
+
+    let res = client.try_approve_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidJurisdiction))));
+
+    assert!(client.get_record_opt(&s1).is_none());
+    assert_eq!(client.get_lifecycle_count(&s1), 0);
+    assert!(client.get_record_opt(&s2).is_none());
+    assert_eq!(client.get_lifecycle_count(&s2), 0);
+}
+
+// ── Never-seen address: public read methods return well-defined values ─────────
+
+/// `is_approved` returns `false` for a subject that has never been approved.
+#[test]
+fn test_never_seen_is_approved_returns_false() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    assert!(!client.is_approved(&subject));
+}
+
+/// `get_kyc_state` returns `Missing` for a subject that has no record.
+#[test]
+fn test_never_seen_get_kyc_state_returns_missing() {
+    use crate::KycState;
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    assert_eq!(client.get_kyc_state(&subject), KycState::Missing);
+}
+
+/// `get_tier` returns `0` for a subject that has no record.
+#[test]
+fn test_never_seen_get_tier_returns_zero() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    assert_eq!(client.get_tier(&subject), 0);
+}
+
+/// `get_record_opt` returns `None` for a subject that has no record.
+#[test]
+fn test_never_seen_get_record_opt_returns_none() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    assert!(client.get_record_opt(&subject).is_none());
+}
+
+/// `get_record` panics for a subject that has no record.
+#[test]
+fn test_never_seen_get_record_panics() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    let res = client.try_get_record(&subject);
+    assert!(res.is_err(), "get_record must panic for a never-seen address");
+}
+
+/// `get_lifecycle_count` returns `0` for a subject that has no history.
+#[test]
+fn test_never_seen_lifecycle_count_is_zero() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+}
+
+/// `get_lifecycle_history` returns an empty vec for a subject that has no history.
+#[test]
+fn test_never_seen_lifecycle_history_is_empty() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+    let hist = client.get_lifecycle_history(&subject, &0, &50);
+    assert_eq!(hist.len(), 0);
+}
+
+/// `get_subjects_by_verifier` returns an empty vec for a verifier that has never
+/// approved anyone.
+#[test]
+fn test_never_seen_get_subjects_by_verifier_is_empty() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let subjects = client.get_subjects_by_verifier(&verifier, &0, &50);
+    assert_eq!(subjects.len(), 0);
+}
+
+/// All public read methods are consistent: a fresh address has no record, no
+/// state, tier 0, and empty history.
+#[test]
+fn test_never_seen_all_read_methods_consistent() {
+    use crate::KycState;
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+
+    // Boolean approval check.
+    assert!(!client.is_approved(&subject));
+    // State enum — must be Missing, not a default record or panic.
+    assert_eq!(client.get_kyc_state(&subject), KycState::Missing);
+    // Tier defaults to 0, not a panic.
+    assert_eq!(client.get_tier(&subject), 0);
+    // Optional record — must be None.
+    assert!(client.get_record_opt(&subject).is_none());
+    // Lifecycle count and history — both reflect zero.
+    assert_eq!(client.get_lifecycle_count(&subject), 0);
+    let hist = client.get_lifecycle_history(&subject, &0, &10);
+    assert_eq!(hist.len(), 0);
+}
+
+// ── Batch duplicate subject regression ────────────────────────────────────────
+
+/// A `revoke_batch` call that contains the same address twice is accepted today
+/// (no deduplication guard): both iterations execute, producing two lifecycle
+/// entries and two verifier log entries.  The final record is Revoked.
+///
+/// This test documents and regresses the current contract semantics so that any
+/// future change to batch deduplication is deliberate and visible.
+#[test]
+fn test_revoke_batch_duplicate_subject_current_semantics() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let addr = Address::generate(&env);
+    // Approve first so the subject has a record with tier 0 (revoke is valid).
+    client.approve(&verifier, &addr, &0, &0, &js(&env, "US"));
+    assert_eq!(client.get_lifecycle_count(&addr), 1);
+
+    // Build a two-entry revoke batch with the same address.
+    let mut subjects = Vec::new(&env);
+    subjects.push_back(addr.clone());
+    subjects.push_back(addr.clone());
+
+    // Must succeed — no duplicate guard in revoke_batch today.
+    client.revoke_batch(&verifier, &subjects);
+
+    // The subject is revoked.
+    assert!(!client.is_approved(&addr));
+    let record = client.get_record(&addr);
+    assert!(matches!(record.status, KycStatus::Revoked));
+
+    // Three lifecycle entries: original Approve + two Revoke iterations.
+    assert_eq!(
+        client.get_lifecycle_count(&addr),
+        3,
+        "each revoke_batch iteration appends a transition, even for the same address"
+    );
+    let hist = client.get_lifecycle_history(&addr, &0, &10);
+    assert_eq!(hist.get(0).unwrap().kind, KycTransitionKind::Approve);
+    assert_eq!(hist.get(1).unwrap().kind, KycTransitionKind::Revoke);
+    assert_eq!(hist.get(2).unwrap().kind, KycTransitionKind::Revoke);
+}
+
+/// A `revoke_batch` call with a duplicate where the first iteration sets status
+/// to Revoked is followed by the second iteration, which also sets it Revoked
+/// again (idempotent write).  No other subjects' records are affected.
+#[test]
+fn test_revoke_batch_duplicate_does_not_affect_other_subjects() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let dup = Address::generate(&env);
+    let other = Address::generate(&env);
+    client.approve(&verifier, &dup, &0, &0, &js(&env, "US"));
+    client.approve(&verifier, &other, &0, &0, &js(&env, "US"));
+
+    let mut subjects = Vec::new(&env);
+    subjects.push_back(dup.clone());
+    subjects.push_back(dup.clone()); // duplicate
+    subjects.push_back(other.clone());
+
+    client.revoke_batch(&verifier, &subjects);
+
+    // `other` has exactly 2 transitions: its Approve + the single Revoke.
+    assert_eq!(client.get_lifecycle_count(&other), 2);
+    let hist_other = client.get_lifecycle_history(&other, &1, &1);
+    assert_eq!(hist_other.get(0).unwrap().kind, KycTransitionKind::Revoke);
+}
+
+// ── Batch boundary tests ───────────────────────────────────────────────────────
+
+/// `approve_batch` with an empty subjects list is rejected with `EmptyBatch`.
+/// No verifier-log or lifecycle side effects occur.
+#[test]
+fn test_approve_batch_empty_returns_empty_batch_error() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let subjects: Vec<(Address, u32, u64, String)> = Vec::new(&env);
+    let res = client.try_approve_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::EmptyBatch))));
+
+    // No global log entry was written.
+    assert_eq!(client.verifier_log_count(), 0);
+}
+
+/// `approve_batch` with exactly 20 subjects (the documented maximum) succeeds.
+/// Every subject gets an approved record and a lifecycle entry.
+#[test]
+fn test_approve_batch_at_maximum_of_20_succeeds() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut subjects_vec = Vec::new(&env);
+    let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..20u32 {
+        let addr = Address::generate(&env);
+        addrs.push_back(addr.clone());
+        subjects_vec.push_back((addr, 1u32, 0u64, js(&env, "US")));
+    }
+
+    // Must not error — 20 is the contract's documented maximum.
+    client.approve_batch(&verifier, &subjects_vec);
+
+    // All 20 subjects are approved with a lifecycle entry.
+    for i in 0..addrs.len() {
+        let addr = addrs.get(i).unwrap();
+        assert!(
+            client.is_approved(&addr),
+            "subject {i} must be approved after a max-size batch"
+        );
+        assert_eq!(
+            client.get_lifecycle_count(&addr),
+            1,
+            "subject {i} must have exactly one lifecycle entry"
+        );
+    }
+
+    // Exactly 20 verifier log entries.
+    assert_eq!(client.verifier_log_count(), 20);
+}
+
+/// `approve_batch` with 21 subjects (one over the maximum) is rejected with
+/// `BatchTooLarge`.  No records are modified (the guard fires before iteration).
+#[test]
+fn test_approve_batch_one_over_maximum_returns_batch_too_large() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut subjects_vec = Vec::new(&env);
+    let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..21u32 {
+        let addr = Address::generate(&env);
+        addrs.push_back(addr.clone());
+        subjects_vec.push_back((addr, 1u32, 0u64, js(&env, "US")));
+    }
+
+    let res = client.try_approve_batch(&verifier, &subjects_vec);
+    assert_eq!(res, Err(Ok(Error::from(KycError::BatchTooLarge))));
+
+    // No records written — the size guard fires before the iteration loop.
+    for i in 0..addrs.len() {
+        let addr = addrs.get(i).unwrap();
+        assert!(
+            client.get_record_opt(&addr).is_none(),
+            "no record must exist for subject {i} after a rejected oversized batch"
+        );
+        assert_eq!(
+            client.get_lifecycle_count(&addr),
+            0,
+            "no lifecycle entry must exist for subject {i} after a rejected oversized batch"
+        );
+    }
+
+    // No verifier log entries.
+    assert_eq!(client.verifier_log_count(), 0);
+}
+
+/// `revoke_batch` with an empty subjects list is accepted (no `EmptyBatch` guard
+/// in `revoke_batch`).  The call completes without error and produces no side effects.
+#[test]
+fn test_revoke_batch_empty_succeeds_with_no_side_effects() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let subjects: Vec<Address> = Vec::new(&env);
+    // revoke_batch has no EmptyBatch guard — it succeeds silently.
+    client.revoke_batch(&verifier, &subjects);
+
+    // No log entries emitted.
+    assert_eq!(client.verifier_log_count(), 0);
+}
+
+/// `revoke_batch` with exactly 20 subjects (the documented maximum) succeeds.
+/// Every subject ends up with a Revoked record and two lifecycle entries (Approve
+/// + Revoke).
+#[test]
+fn test_revoke_batch_at_maximum_of_20_succeeds() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..20u32 {
+        let addr = Address::generate(&env);
+        client.approve(&verifier, &addr, &0, &0, &js(&env, "US"));
+        addrs.push_back(addr);
+    }
+
+    let mut revoke_vec = Vec::new(&env);
+    for i in 0..addrs.len() {
+        revoke_vec.push_back(addrs.get(i).unwrap());
+    }
+
+    // Must not error — 20 is the contract's documented maximum.
+    client.revoke_batch(&verifier, &revoke_vec);
+
+    for i in 0..addrs.len() {
+        let addr = addrs.get(i).unwrap();
+        assert!(
+            !client.is_approved(&addr),
+            "subject {i} must not be approved after revoke_batch"
+        );
+        let record = client.get_record(&addr);
+        assert!(
+            matches!(record.status, KycStatus::Revoked),
+            "subject {i} must have Revoked status"
+        );
+        assert_eq!(
+            client.get_lifecycle_count(&addr),
+            2,
+            "subject {i} must have Approve + Revoke lifecycle entries"
+        );
+    }
+}
+
+/// `revoke_batch` with 21 subjects (one over the maximum) is rejected with
+/// `BatchTooLarge`.  No records are modified.
+#[test]
+fn test_revoke_batch_one_over_maximum_returns_batch_too_large() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut addrs: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    for _ in 0..21u32 {
+        let addr = Address::generate(&env);
+        client.approve(&verifier, &addr, &0, &0, &js(&env, "US"));
+        addrs.push_back(addr);
+    }
+
+    let mut revoke_vec = Vec::new(&env);
+    for i in 0..addrs.len() {
+        revoke_vec.push_back(addrs.get(i).unwrap());
+    }
+
+    let res = client.try_revoke_batch(&verifier, &revoke_vec);
+    assert_eq!(res, Err(Ok(Error::from(KycError::BatchTooLarge))));
+
+    // All subjects remain Approved — the size guard fires before iteration.
+    for i in 0..addrs.len() {
+        let addr = addrs.get(i).unwrap();
+        assert!(
+            client.is_approved(&addr),
+            "subject {i} must still be approved after a rejected revoke_batch"
+        );
+        assert_eq!(
+            client.get_lifecycle_count(&addr),
+            1,
+            "subject {i} must still have only the original Approve lifecycle entry"
+        );
+    }
+}
+
 // ── Expiry boundary semantics ─────────────────────────────────────────────────
 
 /// Pins down the exact boundary convention for nonzero expiry:
