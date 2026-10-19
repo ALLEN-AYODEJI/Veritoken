@@ -302,8 +302,28 @@ Set `max_score = 0` to disable risk scoring entirely.
 #### Transfer validation
 ```
 can_transfer(env, from: Address, to: Address, amount: i128) → bool
+evaluate_transfer(env, from: Address, to: Address, amount: i128) → TransferDecision
 ```
-Called by every asset token before executing a transfer. Returns `false` if any rule is violated. Never panics — callers must check the return value and panic themselves.
+`can_transfer` is backward-compatible and skips KYC checks. Asset tokens call `evaluate_transfer` so that KYC-related denials are mapped to a distinct error code. Both functions delegate to the same internal evaluator.
+
+##### Denial reason precedence
+
+`evaluate_transfer` (and therefore every delegated asset-token transfer) returns **the first failing check** in the order listed below. When multiple rules are violated simultaneously only the first-reached reason is returned. This ordering is a **guaranteed implementation contract** — SDK callers and UI consumers may depend on it:
+
+1. `CompliancePaused` — engine-wide pause is active
+2. `FromBlocklisted` — sender is on the blocklist
+3. `ToBlocklisted` — recipient is on the blocklist
+4. `FromNotAllowlisted` / `ToNotAllowlisted` — allowlist mode active and address absent (from checked before to)
+5. KYC checks on `from` (`Missing → Expired → Revoked → Rejected → Pending`), then the same sequence on `to`
+6. Jurisdiction checks (`FromJurisdictionBlocked`, `ToJurisdictionBlocked`, `SameJurisdictionRequired`)
+7. Tier policy (`TierPolicyBlocked`, `TierFromBelowMin`, `TierToBelowMin`, `TierAmountExceeded`)
+8. Risk scoring (`RiskScoreTooHigh`)
+9. Amount cap (`AmountExceeded`)
+10. Sender holding period (`HoldingPeriodNotMet`)
+11. Recipient holding period (`RecipientHoldingPeriodExceeded`)
+12. Holder cap (`MaxHoldersReached`)
+
+> **Note:** This table reflects the current source order in `evaluate_transfer_inner`. If future rule additions change this ordering a version bump and a doc update will accompany the change.
 
 ---
 

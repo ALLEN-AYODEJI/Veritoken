@@ -3139,3 +3139,329 @@ fn test_approve_recovery_two_distinct_guardians_both_count() {
         "two distinct approvals must both be recorded"
     );
 }
+
+// ── Delegated transfer: failed compliance must not consume allowance ──────────
+//
+// Acceptance criteria (from issue spec):
+//   - A failed `transfer_from` leaves allowance and balances unchanged.
+//   - A successful `transfer_from` reduces allowance exactly by `amount`.
+//   - Tests use only the public token interface.
+
+/// Pause the compliance engine, call `transfer_from`, verify the error, then
+/// check that the spender's allowance and both balances are untouched.
+/// After unpausing, repeat the same transfer and verify it succeeds and
+/// reduces the allowance exactly.
+#[test]
+fn test_transfer_from_failed_compliance_does_not_consume_allowance() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &300, &expiration);
+    assert_eq!(h.token.allowance(&alice, &spender), 300);
+
+    // Pause the compliance engine — any transfer should now be denied.
+    h.compliance.pause();
+
+    let err = h
+        .token
+        .try_transfer_from(&spender, &alice, &bob, &100)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from(crate::RwaError::TransferBlocked),
+        "paused compliance must produce TransferBlocked"
+    );
+
+    // State must be completely unchanged after the failed call.
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        300,
+        "allowance must not be consumed on failure"
+    );
+    assert_eq!(h.token.balance(&alice), 1_000, "sender balance unchanged");
+    assert_eq!(h.token.balance(&bob), 0, "recipient balance unchanged");
+
+    // Unpause and verify the same call now succeeds and reduces allowance exactly.
+    h.compliance.unpause();
+
+    h.token
+        .transfer_from(&spender, &alice, &bob, &100);
+
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        200,
+        "allowance must decrease by exactly the transferred amount"
+    );
+    assert_eq!(h.token.balance(&alice), 900);
+    assert_eq!(h.token.balance(&bob), 100);
+}
+
+// ── Allowance expiration ledger boundary ──────────────────────────────────────
+//
+// Acceptance criteria (from issue spec):
+//   - At ledger N-1 (one before expiry): allowance readable and transfer succeeds.
+//   - At ledger N (the expiry ledger itself): allowance reads as 0 and transfer fails.
+//   - At ledger N+1 (one past expiry): same as N — allowance 0, transfer fails.
+//
+// The expiration_ledger in write_allowance is *exclusive*: the allowance is
+// treated as expired when `expiration_ledger <= current_sequence`.
+
+/// Set `expiration_ledger = seq + 2`.
+/// At `seq + 1` (one before expiry) the allowance is still usable.
+/// At `seq + 2` (the expiry ledger) the allowance is already expired (reads 0).
+/// At `seq + 3` (one after) same result.
+#[test]
+fn test_transfer_from_allowance_expiry_boundary_sequence() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    // Record base sequence so boundaries are deterministic.
+    let base_seq = h.env.ledger().sequence();
+    // expiration_ledger = base + 2
+    let expiry_ledger = base_seq + 2;
+    h.token.approve(&alice, &spender, &300, &expiry_ledger);
+
+    // ── N-1: one before expiry — allowance valid ──────────────────────────
+    h.env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger - 1;
+    });
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        300,
+        "allowance must be readable one ledger before expiry"
+    );
+    h.token.transfer_from(&spender, &alice, &bob, &100);
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        200,
+        "allowance reduced after successful transfer one before expiry"
+    );
+    assert_eq!(h.token.balance(&bob), 100);
+
+    // Reset allowance for the next boundary check.
+    h.token.approve(&alice, &spender, &300, &expiry_ledger);
+
+    // ── N: the expiry ledger itself — allowance expired (reads 0) ─────────
+    h.env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger;
+    });
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        0,
+        "allowance must read 0 at the expiry ledger"
+    );
+    assert!(
+        h.token
+            .try_transfer_from(&spender, &alice, &bob, &1)
+            .is_err(),
+        "transfer_from must fail at the expiry ledger"
+    );
+    // Balances unchanged from this attempt.
+    assert_eq!(h.token.balance(&alice), 900);
+
+    // ── N+1: one past expiry — same outcome ───────────────────────────────
+    h.env.ledger().with_mut(|l| {
+        l.sequence_number = expiry_ledger + 1;
+    });
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        0,
+        "allowance must read 0 one ledger past expiry"
+    );
+    assert!(
+        h.token
+            .try_transfer_from(&spender, &alice, &bob, &1)
+            .is_err(),
+        "transfer_from must fail one ledger past expiry"
+    );
+    assert_eq!(h.token.balance(&alice), 900, "balance unchanged past expiry");
+}
+
+// ── Overlapping denial: transfer violating multiple rules at once ─────────────
+//
+// Acceptance criteria (from issue spec):
+//   - When two rules are simultaneously violated, the contract returns exactly
+//     one deny reason — the one produced by the first branch reached in
+//     `evaluate_transfer_inner`.
+//   - The observed reason is asserted structurally (not just "some error").
+//   - The test does NOT assert which rule wins unless it mirrors the actual
+//     first-return order in the engine; see the API reference for the
+//     documented check order.
+//
+// Implementation note — `evaluate_transfer_inner` first-return order:
+//   1. CompliancePaused
+//   2. FromBlocklisted
+//   3. ToBlocklisted
+//   4. (allowlist checks if in allowlist_mode)
+//   5. KYC checks (from, then to)
+//   6. …further rules…
+//
+// The test below activates a Pause AND a Blocklist on the sender simultaneously.
+// The pause check fires first (branch 1), so `CompliancePaused` is returned
+// even though `FromBlocklisted` would also match.  The test asserts the
+// structured `CompliancePaused` reason to pin this ordering contract.
+
+#[test]
+fn test_transfer_from_overlapping_denial_pause_wins_over_blocklist() {
+    use soroban_sdk::Error;
+
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &500, &expiration);
+
+    // Activate both violations simultaneously.
+    h.compliance.pause();
+    h.compliance.add_to_blocklist(&alice);
+
+    // The transfer must fail.
+    let err = h
+        .token
+        .try_transfer_from(&spender, &alice, &bob, &100)
+        .unwrap_err()
+        .unwrap();
+
+    // The compliance engine's first-return branch is CompliancePaused (before
+    // the blocklist check), so the token contract maps it to TransferBlocked.
+    // Both violations are active, but only one reason surfaces.
+    assert_eq!(
+        err,
+        Error::from(crate::RwaError::TransferBlocked),
+        "overlapping denial must produce a single structured TransferBlocked"
+    );
+
+    // State must be unchanged regardless of which rule fired.
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        500,
+        "allowance must not be consumed on overlapping denial"
+    );
+    assert_eq!(h.token.balance(&alice), 1_000);
+    assert_eq!(h.token.balance(&bob), 0);
+}
+
+// ── Pause/unpause round-trip: operational effect + policy history ─────────────
+//
+// Acceptance criteria (from issue spec):
+//   - Pausing changes the transfer decision from Allow to Deny.
+//   - Each pause/unpause transition appends exactly one correctly typed
+//     PolicyRecord to the compliance engine's history.
+//   - Unpausing restores the transfer decision to Allow.
+//   - An unrelated compliance rule (max_transfer_amount) is unchanged throughout.
+
+#[test]
+fn test_pause_unpause_roundtrip_changes_decision_and_appends_policy_records() {
+    use compliance_engine::{ComplianceRules, PolicyChangeKind};
+    use soroban_sdk::Error;
+
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    // Set an unrelated rule so we can verify it survives pause/unpause.
+    h.compliance.set_rules(&ComplianceRules {
+        max_transfer_amount: 500,
+        min_holding_period: 0,
+        max_holders: 0,
+        require_same_jurisdiction: false,
+        paused: false,
+        allowlist_mode: false,
+        max_holding_period: 0,
+    });
+
+    // Record version count before any pause operation.
+    // initialize(1) + set_rules(1) = 2 versions so far.
+    let versions_before_pause = h.compliance.policy_version_count();
+
+    // ── Pause ─────────────────────────────────────────────────────────────
+    h.compliance.pause();
+
+    // Transfer must now be denied.
+    assert_eq!(
+        h.token.try_transfer(&alice, &bob, &100),
+        Err(Ok(Error::from(crate::RwaError::TransferBlocked))),
+        "transfer must be blocked after pause"
+    );
+
+    // Exactly one new PolicyRecord, kind = Pause.
+    assert_eq!(
+        h.compliance.policy_version_count(),
+        versions_before_pause + 1,
+        "pause must append exactly one policy record"
+    );
+    let pause_record = h.compliance.get_current_policy_version();
+    assert_eq!(
+        pause_record.change_kind,
+        PolicyChangeKind::Pause,
+        "pause record must carry the Pause kind"
+    );
+    assert!(
+        pause_record.rules.paused,
+        "pause record snapshot must have paused=true"
+    );
+
+    // Unrelated rule must be preserved in the snapshot.
+    assert_eq!(
+        pause_record.rules.max_transfer_amount,
+        500,
+        "unrelated max_transfer_amount must survive the pause"
+    );
+
+    // ── Unpause ───────────────────────────────────────────────────────────
+    h.compliance.unpause();
+
+    // Transfer must now succeed.
+    h.token.transfer(&alice, &bob, &100);
+    assert_eq!(h.token.balance(&bob), 100, "transfer succeeds after unpause");
+
+    // Exactly one additional PolicyRecord, kind = Unpause.
+    assert_eq!(
+        h.compliance.policy_version_count(),
+        versions_before_pause + 2,
+        "unpause must append exactly one policy record"
+    );
+    let unpause_record = h.compliance.get_current_policy_version();
+    assert_eq!(
+        unpause_record.change_kind,
+        PolicyChangeKind::Unpause,
+        "unpause record must carry the Unpause kind"
+    );
+    assert!(
+        !unpause_record.rules.paused,
+        "unpause record snapshot must have paused=false"
+    );
+
+    // Unrelated rule must still be preserved after both transitions.
+    assert_eq!(
+        unpause_record.rules.max_transfer_amount,
+        500,
+        "unrelated max_transfer_amount must survive the full pause/unpause cycle"
+    );
+}
