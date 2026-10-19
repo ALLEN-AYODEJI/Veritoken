@@ -259,6 +259,51 @@ fn test_transfer_happy_path() {
 }
 
 #[test]
+fn test_transfer_methods_reject_nonpositive_amounts_without_state_changes() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &500, &expiration);
+    let expected_error = Err(Ok(Error::from(crate::RwaError::NegativeAmount)));
+
+    for amount in [0, -1] {
+        assert_eq!(h.token.try_transfer(&alice, &bob, &amount), expected_error);
+        assert_eq!(
+            h.token
+                .try_transfer_from(&spender, &alice, &bob, &amount),
+            expected_error
+        );
+
+        let recipients = vec![
+            &h.env,
+            RecipientEntry {
+                to: bob.clone(),
+                amount,
+            },
+        ];
+        assert_eq!(
+            h.token.try_batch_transfer(&alice, &recipients),
+            expected_error
+        );
+        assert_eq!(
+            h.token
+                .try_batch_transfer_from(&spender, &alice, &recipients),
+            expected_error
+        );
+
+        assert_eq!(h.token.balance(&alice), 1_000);
+        assert_eq!(h.token.balance(&bob), 0);
+        assert_eq!(h.token.allowance(&alice, &spender), 500);
+    }
+}
+
+#[test]
 fn test_transfer_blocked_without_kyc_on_receiver() {
     let h = setup();
     let alice = Address::generate(&h.env);
@@ -2277,6 +2322,54 @@ fn test_single_and_batch_transfer_enforce_same_freeze_rule_for_sender() {
     assert_eq!(h.token.balance(&alice), 1_000);
     assert_eq!(h.token.balance(&bob), 0);
     assert_eq!(h.compliance.holder_count(), 1);
+}
+
+#[test]
+fn test_transfer_from_rejects_frozen_source_without_state_changes() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &300, &expiration);
+    h.freeze(&alice);
+
+    assert_eq!(
+        h.token
+            .try_transfer_from(&spender, &alice, &bob, &100),
+        Err(Ok(Error::from(crate::RwaError::AccountFrozen)))
+    );
+    assert_eq!(h.token.balance(&alice), 1_000);
+    assert_eq!(h.token.balance(&bob), 0);
+    assert_eq!(h.token.allowance(&alice, &spender), 300);
+}
+
+#[test]
+fn test_transfer_from_rejects_frozen_destination_without_state_changes() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &300, &expiration);
+    h.freeze(&bob);
+
+    assert_eq!(
+        h.token
+            .try_transfer_from(&spender, &alice, &bob, &100),
+        Err(Ok(Error::from(crate::RwaError::AccountFrozen)))
+    );
+    assert_eq!(h.token.balance(&alice), 1_000);
+    assert_eq!(h.token.balance(&bob), 0);
+    assert_eq!(h.token.allowance(&alice, &spender), 300);
 }
 
 /// Single transfer and batch transfer must enforce the same KYC rule for
