@@ -2062,6 +2062,61 @@ fn test_create_invoice_non_empty_id_accepted() {
     assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
 }
 
+// ── #939: Partial invoice settlement arithmetic ───────────────────────────────
+
+#[test]
+fn test_partial_invoice_settlement_arithmetic() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value = 1_000_000_000_000, issue 10 tokens.
+    h.token.issue(&inv_id(&h.env), &holder, &10);
+
+    let face = 1_000_000_000_000i128;
+
+    // Step 1: first partial payment (30% of face) → PartiallySettled.
+    let first_payment = face * 30 / 100;
+    h.token.partial_settle(&inv_id(&h.env), &first_payment);
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::PartiallySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), first_payment);
+
+    // Step 2: second partial_settle attempt is rejected (already PartiallySettled).
+    let second_payment = face * 50 / 100;
+    assert!(h
+        .token
+        .try_partial_settle(&inv_id(&h.env), &second_payment)
+        .is_err());
+    // Status and amount are unchanged after the failed attempt.
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::PartiallySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), first_payment);
+
+    // Step 3: settle() upgrades to FullySettled and replaces settlement_amount with face.
+    h.token.settle(&inv_id(&h.env));
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::FullySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), face);
+
+    // Redeem all 10 tokens — supply goes to zero, status becomes Redeemed (terminal).
+    h.token.redeem(&inv_id(&h.env), &holder, &10);
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::Redeemed
+    );
+    assert_eq!(h.token.total_supply(&inv_id(&h.env)), 0);
+
+    // Further settlement on a Redeemed invoice must be rejected.
+    assert!(h.token.try_settle(&inv_id(&h.env)).is_err());
+}
+
 // Fix #847 — append_journal_entry: reject empty event tags
 // Before the fix, there was no public append_journal_entry entry point.
 // A journal entry recorded without a meaningful tag would make the lifecycle
