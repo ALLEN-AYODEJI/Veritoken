@@ -2093,3 +2093,237 @@ fn test_append_journal_entry_rejects_empty_event_tag() {
     let entry = journal.get(journal.len() - 1).expect("last entry");
     assert_eq!(entry.event_tag, tag);
 }
+
+// ── #943 Invoice lifecycle pause scope ───────────────────────────────────────
+
+/// Focused matrix: one lifecycle mutation (settle), one transfer, and one read
+/// are exercised while lifecycle pause is active.  After unpause the mutation
+/// must succeed.
+#[test]
+fn test_lifecycle_pause_scope_matrix() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+
+    let id = inv_id(&h.env);
+    h.token.issue(&id, &alice, &1_000);
+
+    h.token.pause_lifecycle();
+    assert!(h.token.lifecycle_paused());
+
+    // Lifecycle mutation (settle) is blocked while paused.
+    assert!(
+        h.token.try_settle(&id).is_err(),
+        "settle must be blocked while lifecycle is paused"
+    );
+
+    // Transfer is NOT blocked by the lifecycle pause.
+    h.token.transfer(&id, &alice, &bob, &100);
+    assert_eq!(
+        h.token.balance(&bob, &id),
+        100,
+        "transfer must succeed while lifecycle is paused"
+    );
+
+    // Read (get_journal) is available while paused.
+    let journal = h.token.get_journal(&id);
+    assert!(
+        journal.len() > 0,
+        "journal must be readable while lifecycle is paused"
+    );
+
+    // Unpause; the lifecycle mutation is now available again.
+    h.token.unpause_lifecycle();
+    assert!(!h.token.lifecycle_paused());
+    h.token.settle(&id);
+    assert_eq!(
+        h.token.invoice_status(&id),
+        InvoiceStatus::FullySettled,
+        "settle must succeed after unpause"
+    );
+}
+
+// ── #944 Fee-recipient exemption is reversible ────────────────────────────────
+
+/// Toggles the fee-recipient exempt flag true→false and verifies the query
+/// tracks each change.  Also confirms the exemption flag governs whether a
+/// blocklisted fee recipient blocks or passes a transfer.
+#[test]
+fn test_fee_recipient_exemption_reversible() {
+    let h = setup();
+    let fee_recipient = Address::generate(&h.env);
+    h.approve_kyc(&fee_recipient);
+
+    let inv = String::from_str(&h.env, "FEE-REV-001");
+    h.token.create_invoice(&make_fee_invoice(
+        &h.env,
+        "FEE-REV-001",
+        Some(fee_recipient.clone()),
+    ));
+
+    // Default state: not exempt.
+    assert!(!h.token.is_fee_recipient_exempt());
+
+    // Toggle on.
+    h.token.set_fee_recipient_exempt(&true);
+    assert!(
+        h.token.is_fee_recipient_exempt(),
+        "query must return true after set-true"
+    );
+
+    // Toggle off — exemption must be reversible.
+    h.token.set_fee_recipient_exempt(&false);
+    assert!(
+        !h.token.is_fee_recipient_exempt(),
+        "query must return false after set-false"
+    );
+
+    // Unauthorized toggle: a fresh env without mock_all_auths shows the auth guard fires.
+    {
+        let env2 = Env::default();
+        let admin2 = Address::generate(&env2);
+        let token_id2 = env2.register(
+            InvoiceToken,
+            (
+                admin2.clone(),
+                Address::generate(&env2),
+                Address::generate(&env2),
+                meta(&env2),
+            ),
+        );
+        let client2 = InvoiceTokenClient::new(&env2, &token_id2);
+        assert!(
+            client2.try_set_fee_recipient_exempt(&true).is_err(),
+            "unauthorized toggle must be rejected"
+        );
+    }
+
+    // Main contract exemption state is unchanged by the external failure.
+    assert!(!h.token.is_fee_recipient_exempt());
+
+    // Exercise the fee path: exempt=false blocks transfer to blocklisted recipient,
+    // exempt=true allows it, and setting back to false blocks it again.
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.token.issue(&inv, &alice, &10_000);
+    h.compliance.add_to_blocklist(&fee_recipient);
+
+    assert!(
+        h.token.try_transfer(&inv, &alice, &bob, &1_000).is_err(),
+        "blocked fee recipient with exempt=false must fail"
+    );
+
+    h.token.set_fee_recipient_exempt(&true);
+    assert!(h.token.is_fee_recipient_exempt());
+    h.token.transfer(&inv, &alice, &bob, &1_000);
+
+    h.token.set_fee_recipient_exempt(&false);
+    assert!(!h.token.is_fee_recipient_exempt());
+    assert!(
+        h.token.try_transfer(&inv, &alice, &bob, &1_000).is_err(),
+        "blocked fee recipient with exempt restored to false must fail again"
+    );
+}
+
+// ── #945 Invoice journal append authorization and ordering ────────────────────
+
+/// Appends two authorized entries and verifies insertion order.  An
+/// unauthorized attempt (fresh env without auth mocking) is rejected and adds
+/// no entry.
+#[test]
+fn test_journal_append_authorized_ordering_and_unauthorized_rejection() {
+    let h = setup();
+    let id = inv_id(&h.env);
+
+    let baseline_len = h.token.get_journal(&id).len();
+
+    let tag1 = String::from_str(&h.env, "compliance_review");
+    let tag2 = String::from_str(&h.env, "legal_sign_off");
+    h.token.append_journal_entry(&id, &tag1);
+    h.token.append_journal_entry(&id, &tag2);
+
+    // Authorized entries are returned in insertion order.
+    let journal = h.token.get_journal(&id);
+    assert_eq!(journal.len(), baseline_len + 2);
+    assert_eq!(journal.get(baseline_len).unwrap().event_tag, tag1);
+    assert_eq!(journal.get(baseline_len + 1).unwrap().event_tag, tag2);
+
+    // Unauthorized append: without auth mocking the require_admin guard fires.
+    {
+        let env2 = Env::default();
+        let admin2 = Address::generate(&env2);
+        let token_id2 = env2.register(
+            InvoiceToken,
+            (
+                admin2.clone(),
+                Address::generate(&env2),
+                Address::generate(&env2),
+                meta(&env2),
+            ),
+        );
+        let client2 = InvoiceTokenClient::new(&env2, &token_id2);
+        assert!(
+            client2
+                .try_append_journal_entry(
+                    &String::from_str(&env2, "INV-001"),
+                    &String::from_str(&env2, "attempt"),
+                )
+                .is_err(),
+            "unauthorized append must be rejected"
+        );
+        // The failed operation adds no entry.
+        assert_eq!(
+            client2
+                .get_journal(&String::from_str(&env2, "INV-001"))
+                .len(),
+            0
+        );
+    }
+
+    // Main contract journal count is unchanged by the external failure.
+    assert_eq!(h.token.get_journal(&id).len(), baseline_len + 2);
+}
+
+// ── #946 Invoice paging handles the final partial page ────────────────────────
+
+/// Creates 7 invoices and pages through them with page_size=3.
+/// Pages 0 and 1 return 3 entries each; page 2 returns the single remaining
+/// entry; page 3 (past the end) returns an empty vec.  All 7 IDs appear
+/// exactly once across pages 0–2 in list order.
+#[test]
+fn test_get_invoices_page_final_partial_page() {
+    let h = setup();
+
+    for id in [
+        "INV-P02", "INV-P03", "INV-P04", "INV-P05", "INV-P06", "INV-P07",
+    ] {
+        h.token.create_invoice(&h.make_invoice(id));
+    }
+
+    let all = h.token.list_invoices(&0, &50);
+    assert_eq!(all.len(), 7, "setup must produce exactly 7 invoices");
+
+    let page_size: u32 = 3;
+    let p0 = h.token.get_invoices_page(&0, &page_size);
+    let p1 = h.token.get_invoices_page(&1, &page_size);
+    let p2 = h.token.get_invoices_page(&2, &page_size);
+    let p3 = h.token.get_invoices_page(&3, &page_size);
+
+    assert_eq!(p0.len(), 3, "page 0 must be a full page");
+    assert_eq!(p1.len(), 3, "page 1 must be a full page");
+    assert_eq!(p2.len(), 1, "page 2 is the final partial page");
+    assert_eq!(p3.len(), 0, "page 3 is out-of-range and must return empty");
+
+    // All 7 IDs appear exactly once, in list order (pages are a partition of the full list).
+    for i in 0..3u32 {
+        assert_eq!(p0.get(i).unwrap(), all.get(i).unwrap());
+    }
+    for i in 0..3u32 {
+        assert_eq!(p1.get(i).unwrap(), all.get(3 + i).unwrap());
+    }
+    assert_eq!(p2.get(0).unwrap(), all.get(6).unwrap());
+}
