@@ -110,3 +110,36 @@ describe("StatusPage — refresh", () => {
     });
   });
 });
+
+describe("StatusPage — partial endpoint failure", () => {
+  beforeEach(() => {
+    vi.mocked(deploymentHealth.fullReport).mockResolvedValue(degradedReport);
+  });
+
+  it("shows both healthy and failed components when one endpoint fails", async () => {
+    renderPage();
+    
+    await waitFor(() => {
+      expect(screen.getByText("kycRegistry")).toBeDefined();
+      expect(screen.getByText("complianceEngine")).toBeDefined();
+    });
+
+    const banner = await screen.findByRole("status");
+    expect(within(banner).getByText("Degraded")).toBeDefined();
+
+    const okStatus = screen.getAllByText("Operational");
+    expect(okStatus.length).toBeGreaterThan(0);
+
+    expect(screen.getByText("Unreachable")).toBeDefined();
+  });
+
+  it("displays overall degraded state with individual service statuses visible", async () => {
+    renderPage();
+
+    const banner = await screen.findByRole("status");
+    expect(within(banner).getByText("Degraded")).toBeDefined();
+
+    expect(screen.getByText("kycRegistry")).toBeDefined();
+    expect(screen.getByText("complianceEngine")).toBeDefined();
+  });
+});

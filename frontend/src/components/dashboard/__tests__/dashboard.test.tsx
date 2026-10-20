@@ -372,3 +372,71 @@ describe("DividendHistoryChart", () => {
     });
   });
 });
+
+// ── DashboardPage empty state ─────────────────────────────────────────────────
+
+import DashboardPage from "../../../pages/DashboardPage";
+
+describe("DashboardPage empty state", () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it("renders without errors when all balances are zero", async () => {
+    mockContracts.invoice.balance.mockResolvedValue(0n);
+    mockContracts.property.balance.mockResolvedValue(0n);
+    mockContracts.carbon.balance.mockResolvedValue(0n);
+    mockContracts.property.dividendDepositCount.mockResolvedValue(0);
+    mockContracts.kyc.getRecord.mockResolvedValue({
+      status: "Pending",
+      tier: 0,
+      jurisdiction: "",
+      expiry: 0n,
+      verifier: "",
+    });
+
+    render(<DashboardPage />, { wrapper });
+
+    await waitFor(() => {
+      expect(screen.getByText("Portfolio Dashboard")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("0")).toBeInTheDocument();
+    expect(screen.getByText(/no dividend distributions found/i)).toBeInTheDocument();
+  });
+
+  it("shows appropriate empty messages without misleading data", async () => {
+    mockContracts.invoice.balance.mockResolvedValue(0n);
+    mockContracts.property.balance.mockResolvedValue(0n);
+    mockContracts.carbon.balance.mockResolvedValue(0n);
+    mockContracts.invoice.getMeta.mockResolvedValue({
+      invoice_id: "INV-001",
+      issuer: "Issuer",
+      debtor: "Debtor",
+      face_value_usd: 10000000n,
+      discount_rate_bps: 0,
+      due_date: 9999999999n,
+      currency: "USD",
+      ipfs_doc_hash: "",
+      transfer_fee_bps: 0,
+      fee_recipient: null,
+      notification_webhook: "",
+    });
+    mockContracts.invoice.invoiceStatus.mockResolvedValue(1);
+    mockContracts.invoice.isSettled.mockResolvedValue(false);
+    mockContracts.invoice.totalSupply.mockResolvedValue(0n);
+    mockContracts.property.dividendDepositCount.mockResolvedValue(0);
+    mockContracts.kyc.getRecord.mockResolvedValue({
+      status: "Pending",
+      tier: 0,
+      jurisdiction: "",
+      expiry: 0n,
+      verifier: "",
+    });
+
+    render(<DashboardPage />, { wrapper });
+
+    await waitFor(() => {
+      expect(screen.getByText(/no invoice positions found/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/no dividend distributions found/i)).toBeInTheDocument();
+  });
+});
