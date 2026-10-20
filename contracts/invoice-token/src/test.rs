@@ -2583,3 +2583,150 @@ fn test_get_invoices_page_final_partial_page() {
     }
     assert_eq!(p2.get(0).unwrap(), all.get(6).unwrap());
 }
+
+// ── #947 Invoice paging input guards ──────────────────────────────────────────
+
+/// Boundary inputs for get_invoices_page: zero page size and over-limit page
+/// size are rejected, while the maximum supported page size (50) and ordinary
+/// page requests return the expected slices.
+#[test]
+fn test_get_invoices_page_input_guards() {
+    let h = setup();
+    h.token.create_invoice(&h.make_invoice("GUARD-002"));
+    h.token.create_invoice(&h.make_invoice("GUARD-003"));
+
+    let all = h.token.list_invoices(&0, &50);
+    assert_eq!(all.len(), 3, "setup must produce exactly 3 invoices");
+
+    // Zero page size is rejected.
+    assert_eq!(
+        h.token.try_get_invoices_page(&0, &0),
+        Err(Ok(InvoiceError::InvalidPageSize.into())),
+        "page_size=0 must be rejected"
+    );
+
+    // Over-limit page size (max is 50) is rejected.
+    assert_eq!(
+        h.token.try_get_invoices_page(&0, &51),
+        Err(Ok(InvoiceError::InvalidPageSize.into())),
+        "page_size=51 must be rejected"
+    );
+
+    // Maximum supported page size succeeds and returns the whole set.
+    let max_page = h.token.get_invoices_page(&0, &50);
+    assert_eq!(max_page.len(), 3);
+    for i in 0..3u32 {
+        assert_eq!(max_page.get(i).unwrap(), all.get(i).unwrap());
+    }
+
+    // Ordinary page request returns the correct slice.
+    let page0 = h.token.get_invoices_page(&0, &2);
+    assert_eq!(page0.len(), 2);
+    assert_eq!(page0.get(0).unwrap(), all.get(0).unwrap());
+    assert_eq!(page0.get(1).unwrap(), all.get(1).unwrap());
+
+    let page1 = h.token.get_invoices_page(&1, &2);
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1.get(0).unwrap(), all.get(2).unwrap());
+
+    // Extreme page number is past the end and returns an empty slice.
+    let far = h.token.get_invoices_page(&u32::MAX, &2);
+    assert_eq!(far.len(), 0);
+}
+
+// ── #948 Webhook replacement does not change invoice state ────────────────────
+
+/// Replacing the webhook twice keeps the latest value and leaves invoice
+/// status and economic metadata untouched.  Invalid and unauthorized updates
+/// follow the existing error behaviour.
+#[test]
+fn test_set_webhook_replacement_preserves_invoice_state() {
+    let h = setup();
+    let id = inv_id(&h.env);
+
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&id, &holder, &1_000);
+    h.token.partial_settle(&id, &400_000_000_000);
+
+    let baseline_meta = h.token.get_meta(&id);
+    let baseline_status = h.token.invoice_status(&id);
+    let baseline_settlement = h.token.settlement_amount(&id);
+    let baseline_supply = h.token.total_supply(&id);
+    let baseline_balance = h.token.balance(&holder, &id);
+    let baseline_journal = h.token.get_journal(&id).len();
+
+    let first = String::from_str(&h.env, "https://example.com/hook-1");
+    let second = String::from_str(&h.env, "https://example.com/hook-2");
+    h.token.set_webhook(&id, &first);
+    assert_eq!(h.token.get_meta(&id).notification_webhook, first);
+
+    h.token.set_webhook(&id, &second);
+    let after_meta = h.token.get_meta(&id);
+    assert_eq!(
+        after_meta.notification_webhook, second,
+        "latest webhook value must be retained"
+    );
+
+    // Unrelated metadata is stable.
+    assert_eq!(after_meta.invoice_id, baseline_meta.invoice_id);
+    assert_eq!(after_meta.issuer, baseline_meta.issuer);
+    assert_eq!(after_meta.debtor, baseline_meta.debtor);
+    assert_eq!(after_meta.face_value_usd, baseline_meta.face_value_usd);
+    assert_eq!(
+        after_meta.discount_rate_bps,
+        baseline_meta.discount_rate_bps
+    );
+    assert_eq!(after_meta.due_date, baseline_meta.due_date);
+    assert_eq!(after_meta.currency, baseline_meta.currency);
+    assert_eq!(after_meta.transfer_fee_bps, baseline_meta.transfer_fee_bps);
+
+    // Status, settlement and token accounting are unchanged.
+    assert_eq!(h.token.invoice_status(&id), baseline_status);
+    assert_eq!(h.token.settlement_amount(&id), baseline_settlement);
+    assert_eq!(h.token.total_supply(&id), baseline_supply);
+    assert_eq!(h.token.balance(&holder, &id), baseline_balance);
+    assert_eq!(h.token.get_journal(&id).len(), baseline_journal);
+
+    // Invalid webhook value follows the existing error and leaves state intact.
+    assert_eq!(
+        h.token
+            .try_set_webhook(&id, &String::from_str(&h.env, "ftp://bad-scheme.example.com")),
+        Err(Ok(InvoiceError::InvalidWebhook.into()))
+    );
+    assert_eq!(h.token.get_meta(&id).notification_webhook, second);
+
+    // Unauthorized update: a fresh env without auth mocking rejects the call.
+    {
+        let env2 = Env::default();
+        let admin2 = Address::generate(&env2);
+        let token_id2 = env2.register(
+            InvoiceToken,
+            (
+                admin2.clone(),
+                Address::generate(&env2),
+                Address::generate(&env2),
+                meta(&env2),
+            ),
+        );
+        let client2 = InvoiceTokenClient::new(&env2, &token_id2);
+        assert!(
+            client2
+                .try_set_webhook(
+                    &String::from_str(&env2, "INV-001"),
+                    &String::from_str(&env2, "https://example.com/hook"),
+                )
+                .is_err(),
+            "unauthorized webhook update must be rejected"
+        );
+        assert!(client2
+            .get_meta(&String::from_str(&env2, "INV-001"))
+            .notification_webhook
+            .is_empty());
+    }
+
+    // Main contract state is unchanged by the external failure.
+    assert_eq!(h.token.get_meta(&id).notification_webhook, second);
+    assert_eq!(h.token.invoice_status(&id), baseline_status);
+    assert_eq!(h.token.settlement_amount(&id), baseline_settlement);
+}

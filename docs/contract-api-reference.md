@@ -515,6 +515,34 @@ Created ──issue()──► Issued ──partial_settle()──► PartiallyS
                                                                           (supply → 0) ► Redeemed
 ```
 
+### Terminology: settlement, redemption, and burn
+
+These three operations are distinct and are **not** synonyms. Settlement records payment against the invoice; redemption is the holder-side exit that burns tokens once settlement has occurred; `burn` is the generic SEP-41 supply-reduction primitive.
+
+| Term | Method(s) | Caller | State transition | Effect on supply / outstanding amount |
+|---|---|---|---|---|
+| Partial settlement | `partial_settle(invoice_id, settlement_amount)` | Admin | `Issued` → `PartiallySettled` (or stays `PartiallySettled`) | No change to token supply. Increases the recorded `settlement_amount`; the outstanding (unsettled) amount decreases by `settlement_amount`. |
+| Full settlement | `settle(invoice_id)` | Admin | `Issued` or `PartiallySettled` → `FullySettled` | No change to token supply. Records the remaining amount as settled; outstanding amount becomes zero and redemption becomes available. |
+| Redemption | `redeem(invoice_id, from, amount)` | Token holder (`from.require_auth()`) | `FullySettled` → `Redeemed` once total supply reaches zero; otherwise stays `FullySettled` | Burns the redeemed tokens, reducing total supply. When supply reaches zero the invoice moves to `Redeemed`. Requires prior settlement (`NotSettled` otherwise). |
+| Burn (SEP-41) | `burn(invoice_id, from, amount)`, `burn_from(spender, invoice_id, from, amount)` | Token holder (`from`) or approved spender (`spender`) | No lifecycle transition; status is unchanged | Reduces total supply by `amount`. Does not record settlement and does not by itself move the invoice to `Redeemed`. |
+
+Notes:
+- Settlement methods (`settle`, `partial_settle`) are admin-only and are blocked while the lifecycle pause is active (`LifecyclePaused`).
+- `redeem` is the only path that advances an invoice to `Redeemed`, and only when the resulting supply is zero.
+- `burn` / `burn_from` are the standard SEP-41 supply-reduction methods; they are not a substitute for `redeem` when the goal is to close out a settled invoice.
+
+#### Example lifecycle (plain amounts)
+
+Assume an invoice with `face_value_usd = 1000` and 1000 tokens issued (1 token per unit of face value):
+
+1. `create_invoice(meta)` — invoice is `Created`; supply is 0.
+2. `issue(invoice_id, to, 1000)` — invoice is `Issued`; supply is 1000; outstanding amount is 1000.
+3. `partial_settle(invoice_id, 400)` — invoice is `PartiallySettled`; supply is still 1000; outstanding amount is 600.
+4. `settle(invoice_id)` — invoice is `FullySettled`; supply is still 1000; outstanding amount is 0; redemption is now open.
+5. `redeem(invoice_id, holder, 1000)` — holder's tokens are burned; supply becomes 0; invoice becomes `Redeemed`.
+
+If instead a holder calls `burn(invoice_id, holder, 1000)` at step 5, supply also becomes 0, but the call is a plain SEP-41 burn and does not itself perform the redemption accounting path.
+
 ### Data structures
 
 #### `InvoiceMeta`
