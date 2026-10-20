@@ -2158,6 +2158,82 @@ fn test_batch_settle_mixed_per_item_results() {
     assert!(h.token.try_get_meta(&id_missing).is_err());
 }
 
+// ── #941: Empty and maximum invoice settlement batches ────────────────────────
+
+#[test]
+fn test_batch_settle_empty_input_returns_no_results() {
+    let h = setup();
+    let empty: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    let results = h.token.batch_settle(&empty);
+    assert_eq!(results.len(), 0);
+}
+
+#[test]
+fn test_batch_settle_exactly_at_limit_processes_all() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // Create and issue exactly 10 invoices (the cap).
+    let raw_ids = [
+        "LIM-00", "LIM-01", "LIM-02", "LIM-03", "LIM-04", "LIM-05", "LIM-06", "LIM-07",
+        "LIM-08", "LIM-09",
+    ];
+    let mut ids: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&h.env);
+    for raw in raw_ids.iter() {
+        let id = String::from_str(&h.env, raw);
+        h.token.create_invoice(&h.make_invoice(raw));
+        h.token.issue(&id, &holder, &10);
+        ids.push_back(id);
+    }
+
+    let mut settlements: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    for i in 0..10u32 {
+        settlements.push_back((ids.get(i).unwrap(), 200_000_000_000i128));
+    }
+
+    let results = h.token.batch_settle(&settlements);
+    // All 10 must be processed with no truncation.
+    assert_eq!(results.len(), 10);
+    for i in 0..10u32 {
+        assert!(
+            results.get(i).unwrap().error.is_none(),
+            "invoice {i} should succeed"
+        );
+    }
+}
+
+#[test]
+fn test_batch_settle_one_above_limit_truncates_to_ten() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // Create 11 invoices; the 11th must not be processed.
+    let raw_ids = [
+        "OVR-00", "OVR-01", "OVR-02", "OVR-03", "OVR-04", "OVR-05", "OVR-06", "OVR-07",
+        "OVR-08", "OVR-09", "OVR-10",
+    ];
+    let mut ids: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&h.env);
+    for raw in raw_ids.iter() {
+        let id = String::from_str(&h.env, raw);
+        h.token.create_invoice(&h.make_invoice(raw));
+        h.token.issue(&id, &holder, &10);
+        ids.push_back(id);
+    }
+
+    let mut settlements: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    for i in 0..11u32 {
+        settlements.push_back((ids.get(i).unwrap(), 200_000_000_000i128));
+    }
+
+    let results = h.token.batch_settle(&settlements);
+    assert_eq!(results.len(), 10);
+
+    // The 11th invoice (index 10) was not processed — it remains unsettled.
+    assert!(!h.token.is_settled(&ids.get(10).unwrap()));
+}
+
 // Fix #847 — append_journal_entry: reject empty event tags
 // Before the fix, there was no public append_journal_entry entry point.
 // A journal entry recorded without a meaningful tag would make the lifecycle
