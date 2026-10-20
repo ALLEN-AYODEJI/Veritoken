@@ -1616,6 +1616,217 @@ fn test_set_external_uri_empty_string_clears_value() {
     assert!(export.external_uri.is_none());
 }
 
+// ── #931 Compliance metadata key replacement ─────────────────────────────────
+//
+// Acceptance criteria:
+//   - Replacing one metadata key leaves unrelated keys untouched.
+//   - Individual reads and the aggregate view agree.
+
+/// Set two compliance metadata keys, replace one, and verify the other is
+/// preserved both through individual reads and the aggregate view.
+#[test]
+fn test_compliance_metadata_replace_one_key_preserves_other() {
+    let h = setup();
+    let key_entity = soroban_sdk::Symbol::new(&h.env, META_LEGAL_ENTITY);
+    let key_isin = soroban_sdk::Symbol::new(&h.env, META_ISIN);
+
+    let entity_v1 = String::from_str(&h.env, "Acme Corp");
+    let isin = String::from_str(&h.env, "US1234567890");
+    let entity_v2 = String::from_str(&h.env, "Acme Holdings Ltd");
+
+    h.token
+        .set_compliance_metadata(&h.admin, &key_entity, &entity_v1, &h.next_nonce());
+    h.token
+        .set_compliance_metadata(&h.admin, &key_isin, &isin, &h.next_nonce());
+
+    // Replace only the legal entity key.
+    h.token
+        .set_compliance_metadata(&h.admin, &key_entity, &entity_v2, &h.next_nonce());
+
+    // Individual reads.
+    assert_eq!(
+        h.token.get_compliance_metadata(&key_entity),
+        entity_v2,
+        "replaced key must return the new value"
+    );
+    assert_eq!(
+        h.token.get_compliance_metadata(&key_isin),
+        isin,
+        "unrelated key must be preserved after replacement"
+    );
+
+    // Aggregate view must agree with individual reads.
+    let meta = h.token.get_all_compliance_metadata();
+    assert_eq!(meta.legal_entity, Some(entity_v2));
+    assert_eq!(meta.isin, Some(isin));
+    assert!(meta.governing_law.is_none());
+    assert!(meta.prospectus_hash.is_none());
+}
+
+// ── #932 Token export metadata completeness ──────────────────────────────────
+//
+// Acceptance criteria:
+//   - Every documented TokenExportMetadata field is asserted.
+//   - The returned structure corresponds to current token state.
+
+/// Initialize a token with representative values and assert every field of
+/// the TokenExportMetadata structure returned by get_token_export.
+#[test]
+fn test_get_token_export_all_required_fields() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let kyc_id = env.register(KycRegistry, ());
+    let kyc = KycRegistryClient::new(&env, &kyc_id);
+    kyc.initialize(&admin);
+    let verifier = Address::generate(&env);
+    kyc.add_verifier(&admin, &verifier);
+
+    let compliance_id = env.register(ComplianceEngine, ());
+    let compliance = ComplianceEngineClient::new(&env, &compliance_id);
+    compliance.initialize(&admin, &kyc_id, &0u64);
+
+    let token_id = env.register(
+        RwaToken,
+        (
+            admin.clone(),
+            6u32,
+            String::from_str(&env, "Export Token"),
+            String::from_str(&env, "EXPT"),
+            String::from_str(&env, "invoice"),
+            kyc_id.clone(),
+            compliance_id.clone(),
+            Option::<ComplianceMetadata>::None,
+            1_000_000i128,
+        ),
+    );
+    let token = RwaTokenClient::new(&env, &token_id);
+
+    // Representative state: supply, metadata keys, external URI.
+    let holder = Address::generate(&env);
+    kyc.approve(&verifier, &holder, &1, &0, &String::from_str(&env, "US"));
+    token.mint(&admin, &holder, &2_500i128);
+
+    let key_entity = soroban_sdk::Symbol::new(&env, META_LEGAL_ENTITY);
+    let key_isin = soroban_sdk::Symbol::new(&env, META_ISIN);
+    let legal_entity = String::from_str(&env, "Export Issuer LLC");
+    let isin = String::from_str(&env, "US9876543210");
+    token.set_compliance_metadata(&admin, &key_entity, &legal_entity, &0);
+    token.set_compliance_metadata(&admin, &key_isin, &isin, &1);
+
+    let uri = String::from_str(&env, "ipfs://QmExportMetadataHash");
+    token.set_external_uri(&uri);
+
+    let export = token.get_token_export();
+
+    // Identity / schema fields.
+    assert_eq!(export.name, String::from_str(&env, "Export Token"));
+    assert_eq!(export.symbol, String::from_str(&env, "EXPT"));
+    assert_eq!(export.decimals, 6u32);
+    assert_eq!(export.asset_type, String::from_str(&env, "invoice"));
+    assert!(
+        !export.contract_version.is_empty(),
+        "contract_version must be populated"
+    );
+
+    // Supply fields.
+    assert_eq!(export.total_supply, 2_500i128);
+    assert_eq!(export.max_supply, 1_000_000i128);
+
+    // Linked contract addresses.
+    assert_eq!(export.kyc_registry, kyc_id);
+    assert_eq!(export.compliance_engine, compliance_id);
+
+    // Configured external metadata fields.
+    assert_eq!(export.legal_entity, Some(legal_entity));
+    assert_eq!(export.isin, Some(isin));
+    assert!(export.governing_law.is_none());
+    assert!(export.prospectus_hash.is_none());
+    assert_eq!(export.external_uri, Some(uri));
+}
+
+// ── #934 Transfer to self ────────────────────────────────────────────────────
+//
+// Acceptance criteria:
+//   - Direct self-transfer leaves balance and total supply unchanged.
+//   - Delegated self-transfer consumes allowance and leaves balances unchanged.
+
+/// A direct transfer from an address to itself must be a no-op on balances
+/// and total supply, while still emitting a transfer event.
+#[test]
+fn test_transfer_to_self_preserves_balance_and_supply() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.mint(&alice, 1_000);
+
+    let balance_before = h.token.balance(&alice);
+    let supply_before = h.token.total_supply();
+
+    h.token.transfer(&alice, &alice, &400);
+
+    assert_eq!(
+        h.token.balance(&alice),
+        balance_before,
+        "self-transfer must not change the balance"
+    );
+    assert_eq!(
+        h.token.total_supply(),
+        supply_before,
+        "self-transfer must not change total supply"
+    );
+    assert_eq!(h.token.balance(&alice), 1_000);
+    assert_eq!(h.token.total_supply(), 1_000);
+}
+
+/// A delegated transfer from an address to itself must consume the spender's
+/// allowance by the transferred amount while leaving balances and supply
+/// unchanged.
+#[test]
+fn test_transfer_from_to_self_consumes_allowance() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let spender = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.mint(&alice, 1_000);
+
+    let expiration = h.env.ledger().sequence() + 1_000;
+    h.token.approve(&alice, &spender, &500, &expiration);
+    assert_eq!(h.token.allowance(&alice, &spender), 500);
+
+    let balance_before = h.token.balance(&alice);
+    let supply_before = h.token.total_supply();
+
+    h.token.transfer_from(&spender, &alice, &alice, &200);
+
+    assert_eq!(
+        h.token.balance(&alice),
+        balance_before,
+        "delegated self-transfer must not change the balance"
+    );
+    assert_eq!(
+        h.token.total_supply(),
+        supply_before,
+        "delegated self-transfer must not change total supply"
+    );
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        300,
+        "allowance must be reduced by the transferred amount"
+    );
+
+    // Spending the remaining allowance fully must leave no allowance behind.
+    h.token.transfer_from(&spender, &alice, &alice, &300);
+    assert_eq!(h.token.balance(&alice), 1_000);
+    assert_eq!(h.token.total_supply(), 1_000);
+    assert_eq!(
+        h.token.allowance(&alice, &spender),
+        0,
+        "fully spent allowance must be zero"
+    );
+}
+
 #[test]
 fn test_get_token_export_max_supply_set_at_constructor() {
     let env = Env::default();
