@@ -3558,3 +3558,461 @@ fn test_pause_unpause_roundtrip_changes_decision_and_appends_policy_records() {
         "unrelated max_transfer_amount must survive the full pause/unpause cycle"
     );
 }
+
+// ── #930 External URI set / read / replace ────────────────────────────────────
+//
+// Acceptance criteria:
+//   - The latest accepted URI is returned exactly by get_external_uri.
+//   - Replacing the URI with a new value returns the new value.
+//   - Clearing with an empty string removes the stored value.
+//   - An unauthorized caller cannot set the URI.
+
+/// Set an HTTPS URI, read it back, replace it, read it back again.
+/// Verifies the round-trip and that the latest value is always returned.
+#[test]
+fn test_external_uri_set_and_read_round_trip() {
+    let h = setup();
+
+    let uri_a = String::from_str(&h.env, "https://api.example.com/tokens/1");
+    h.token.set_external_uri(&uri_a);
+    assert_eq!(
+        h.token.get_external_uri(),
+        uri_a,
+        "get_external_uri must return the URI just set"
+    );
+
+    // Replace with a different URI.
+    let uri_b = String::from_str(&h.env, "ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+    h.token.set_external_uri(&uri_b);
+    assert_eq!(
+        h.token.get_external_uri(),
+        uri_b,
+        "get_external_uri must return the updated URI after replacement"
+    );
+}
+
+/// Clearing the URI with an empty string removes the stored value.
+/// get_external_uri must return an empty string when no URI is set.
+#[test]
+fn test_external_uri_cleared_by_empty_string() {
+    let h = setup();
+
+    // Set a URI first, then clear it.
+    h.token
+        .set_external_uri(&String::from_str(&h.env, "https://example.com/meta"));
+    h.token.set_external_uri(&String::from_str(&h.env, ""));
+
+    assert_eq!(
+        h.token.get_external_uri(),
+        String::from_str(&h.env, ""),
+        "get_external_uri must return empty string after clearing"
+    );
+}
+
+/// get_external_uri returns an empty string when no URI has ever been set.
+#[test]
+fn test_external_uri_unset_returns_empty_string() {
+    let h = setup();
+    assert_eq!(
+        h.token.get_external_uri(),
+        String::from_str(&h.env, ""),
+        "get_external_uri must return empty string when nothing has been stored"
+    );
+}
+
+/// A non-admin caller must be rejected when attempting to set the URI.
+/// Uses a fresh environment without mock_all_auths so authorization is enforced.
+#[test]
+fn test_external_uri_unauthorized_write_rejected() {
+    // Stand up a token without mock_all_auths so Soroban enforces auth checks.
+    let env = Env::default();
+    let admin = Address::generate(&env);
+
+    let kyc_id = env.register(kyc_registry::KycRegistry, ());
+    // initialize does not require auth on KycRegistry — safe to call directly.
+    kyc_registry::KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let ce_id = env.register(compliance_engine::ComplianceEngine, ());
+    compliance_engine::ComplianceEngineClient::new(&env, &ce_id)
+        .initialize(&admin, &kyc_id, &0u64);
+
+    let token_id = env.register(
+        RwaToken,
+        (
+            admin.clone(),
+            7u32,
+            String::from_str(&env, "URI Token"),
+            String::from_str(&env, "URI"),
+            String::from_str(&env, "property"),
+            kyc_id,
+            ce_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+    let token = RwaTokenClient::new(&env, &token_id);
+
+    // Without mock_all_auths, the auth check inside set_external_uri fires.
+    // The call must fail because no auth has been provided.
+    let res = token.try_set_external_uri(&String::from_str(&env, "https://attacker.example.com"));
+    assert!(
+        res.is_err(),
+        "set_external_uri must fail when called without valid admin auth"
+    );
+
+    // The URI must remain unset.
+    assert_eq!(
+        token.get_external_uri(),
+        String::from_str(&env, ""),
+        "URI must remain empty after an unauthorized write attempt"
+    );
+}
+
+// ── #929 Role assign / revoke observable ─────────────────────────────────────
+//
+// Acceptance criteria:
+//   - After assign_role, get_role_holder returns the assigned address.
+//   - After revoke_role, get_role_holder returns None.
+//   - Unauthorized assignment fails.
+
+/// Assign the "compliance" role to a holder, verify it is readable,
+/// then revoke it and verify it is absent.
+#[test]
+fn test_role_assign_and_revoke_observable() {
+    let h = setup();
+    let role_holder = Address::generate(&h.env);
+    let compliance_role = soroban_sdk::Symbol::new(&h.env, "compliance");
+
+    // Before assignment the role must be unset.
+    assert!(
+        h.token.get_role_holder(&compliance_role).is_none(),
+        "role must be unset before assignment"
+    );
+
+    // Assign the role as admin (nonce 0).
+    let nonce = h.next_nonce();
+    h.token.assign_role(&compliance_role, &role_holder, &nonce);
+
+    // get_role_holder must now return the assigned address.
+    assert_eq!(
+        h.token.get_role_holder(&compliance_role),
+        Some(role_holder.clone()),
+        "get_role_holder must return the holder after assignment"
+    );
+
+    // Revoke the role (nonce incremented).
+    let nonce2 = h.next_nonce();
+    h.token.revoke_role(&compliance_role, &nonce2);
+
+    // After revocation get_role_holder must return None.
+    assert!(
+        h.token.get_role_holder(&compliance_role).is_none(),
+        "get_role_holder must return None after revocation"
+    );
+}
+
+/// Assigning different roles keeps them independent — revoking one does not
+/// affect the other.
+#[test]
+fn test_role_assign_multiple_roles_are_independent() {
+    let h = setup();
+    let holder_a = Address::generate(&h.env);
+    let holder_b = Address::generate(&h.env);
+    let compliance_role = soroban_sdk::Symbol::new(&h.env, "compliance");
+    let liquidity_role = soroban_sdk::Symbol::new(&h.env, "liquidity");
+
+    h.token.assign_role(&compliance_role, &holder_a, &h.next_nonce());
+    h.token.assign_role(&liquidity_role, &holder_b, &h.next_nonce());
+
+    assert_eq!(
+        h.token.get_role_holder(&compliance_role),
+        Some(holder_a.clone())
+    );
+    assert_eq!(
+        h.token.get_role_holder(&liquidity_role),
+        Some(holder_b.clone())
+    );
+
+    // Revoke compliance — liquidity must remain.
+    h.token.revoke_role(&compliance_role, &h.next_nonce());
+
+    assert!(h.token.get_role_holder(&compliance_role).is_none());
+    assert_eq!(
+        h.token.get_role_holder(&liquidity_role),
+        Some(holder_b),
+        "liquidity role must be unaffected by revoking compliance"
+    );
+}
+
+/// A non-admin, non-role-holder caller must be rejected by assign_role.
+#[test]
+fn test_role_assign_unauthorized_rejected() {
+    // Build a fresh env without mock_all_auths so auth is enforced.
+    let env2 = Env::default();
+    let admin = Address::generate(&env2);
+
+    let kyc_id = env2.register(kyc_registry::KycRegistry, ());
+    kyc_registry::KycRegistryClient::new(&env2, &kyc_id).initialize(&admin);
+    let ce_id = env2.register(compliance_engine::ComplianceEngine, ());
+    compliance_engine::ComplianceEngineClient::new(&env2, &ce_id)
+        .initialize(&admin, &kyc_id, &0u64);
+
+    // Register the token without blanket auth mocking so auth is enforced.
+    let token_id = env2.register(
+        RwaToken,
+        (
+            admin.clone(),
+            7u32,
+            String::from_str(&env2, "Veritoken RWA"),
+            String::from_str(&env2, "VTRWA"),
+            String::from_str(&env2, "property"),
+            kyc_id,
+            ce_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+    let token = RwaTokenClient::new(&env2, &token_id);
+
+    let intruder = Address::generate(&env2);
+    let compliance_role = soroban_sdk::Symbol::new(&env2, "compliance");
+
+    // intruder has not been authorized — this must fail.
+    let res = token.try_assign_role(&compliance_role, &intruder, &0u64);
+    assert!(
+        res.is_err(),
+        "assign_role from an unauthorized caller must be rejected"
+    );
+    // Role must remain unset.
+    assert!(token.get_role_holder(&compliance_role).is_none());
+}
+
+// ── #928 Nonce replay rejection ───────────────────────────────────────────────
+//
+// Acceptance criteria:
+//   - A consumed nonce cannot authorize a second mutation (InvalidNonce).
+//   - The target state is unchanged after the replay attempt.
+//   - A sequential nonce succeeds.
+
+/// Execute a nonce-protected operation with nonce N, then attempt to replay
+/// with the same nonce N — must be rejected with InvalidNonce.
+/// Then execute with nonce N+1 — must succeed.
+#[test]
+fn test_nonce_replay_rejected_and_sequential_succeeds() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    let compliance_role = soroban_sdk::Symbol::new(&h.env, "compliance");
+
+    // Capture the starting nonce.
+    let nonce_0 = h.token.admin_nonce();
+
+    // First operation: assign the compliance role using nonce_0.
+    h.token.assign_role(&compliance_role, &holder, &nonce_0);
+    assert_eq!(
+        h.token.get_role_holder(&compliance_role),
+        Some(holder.clone()),
+        "role must be set after first assign"
+    );
+
+    // Nonce must have incremented.
+    let nonce_1 = h.token.admin_nonce();
+    assert_eq!(nonce_1, nonce_0 + 1, "nonce must increment after each use");
+
+    // Replay: attempt the same assign with the already-consumed nonce_0.
+    let another_holder = Address::generate(&h.env);
+    let res = h
+        .token
+        .try_assign_role(&compliance_role, &another_holder, &nonce_0);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::InvalidNonce),
+        "replaying nonce_0 must return InvalidNonce"
+    );
+
+    // State must be unchanged — the role still points to the original holder.
+    assert_eq!(
+        h.token.get_role_holder(&compliance_role),
+        Some(holder.clone()),
+        "role holder must be unchanged after a rejected replay"
+    );
+
+    // Sequential: use nonce_1 for a different nonce-protected operation (revoke).
+    h.token.revoke_role(&compliance_role, &nonce_1);
+    assert!(
+        h.token.get_role_holder(&compliance_role).is_none(),
+        "revoke with sequential nonce must succeed"
+    );
+}
+
+/// Replaying a nonce on a different operation type also fails.
+/// This confirms the nonce counter is per-contract, not per-method.
+#[test]
+fn test_nonce_replay_across_different_operations_rejected() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    let liquidity_role = soroban_sdk::Symbol::new(&h.env, "liquidity");
+
+    let nonce_0 = h.token.admin_nonce();
+
+    // Use nonce_0 to assign a role.
+    h.token.assign_role(&liquidity_role, &holder, &nonce_0);
+
+    // Attempt to use the same nonce_0 on a different nonce-protected method (revoke_role).
+    let res = h.token.try_revoke_role(&liquidity_role, &nonce_0);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::InvalidNonce),
+        "replaying a nonce on a different operation must return InvalidNonce"
+    );
+
+    // Role is still set — the revoke was rejected.
+    assert_eq!(
+        h.token.get_role_holder(&liquidity_role),
+        Some(holder),
+        "role must remain after rejected replay"
+    );
+}
+
+// ── #927 Mint cap at exact maximum supply ─────────────────────────────────────
+//
+// Acceptance criteria:
+//   - Minting exactly the remaining supply (reaching the cap) succeeds.
+//   - Minting one unit over the cap is rejected with ExceedsMaxSupply.
+//   - total_supply is unchanged after the rejected over-cap mint.
+
+/// Sets a small max_supply, mints to one below the cap, then:
+///   (a) mints the last unit — must succeed and hit the cap exactly.
+///   (b) tries to mint one more — must be rejected.
+#[test]
+fn test_mint_exactly_at_cap_succeeds_and_over_cap_rejected() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let kyc_id = env.register(kyc_registry::KycRegistry, ());
+    kyc_registry::KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let ce_id = env.register(compliance_engine::ComplianceEngine, ());
+    compliance_engine::ComplianceEngineClient::new(&env, &ce_id)
+        .initialize(&admin, &kyc_id, &0u64);
+
+    // max_supply = 100 (small, for boundary clarity)
+    let token_id = env.register(
+        RwaToken,
+        (
+            admin.clone(),
+            7u32,
+            String::from_str(&env, "Cap Token"),
+            String::from_str(&env, "CAP"),
+            String::from_str(&env, "invoice"),
+            kyc_id.clone(),
+            ce_id.clone(),
+            Option::<ComplianceMetadata>::None,
+            100i128, // max_supply = 100
+        ),
+    );
+    let token = RwaTokenClient::new(&env, &token_id);
+    let kyc = kyc_registry::KycRegistryClient::new(&env, &kyc_id);
+
+    let verifier = Address::generate(&env);
+    kyc.add_verifier(&admin, &verifier);
+
+    let recipient = Address::generate(&env);
+    kyc.approve(
+        &verifier,
+        &recipient,
+        &1,
+        &0,
+        &String::from_str(&env, "US"),
+    );
+
+    // Mint 99 — one below the cap.
+    token.mint(&admin, &recipient, &99i128);
+    assert_eq!(token.total_supply(), 99i128, "supply must be 99 after first mint");
+
+    // Mint the last 1 — must reach the cap exactly.
+    token.mint(&admin, &recipient, &1i128);
+    assert_eq!(
+        token.total_supply(),
+        100i128,
+        "supply must equal max_supply after exact-cap mint"
+    );
+
+    // Attempt to mint 1 more — must be rejected.
+    let res = token.try_mint(&admin, &recipient, &1i128);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::ExceedsMaxSupply),
+        "minting above the cap must return ExceedsMaxSupply"
+    );
+
+    // Total supply must remain at the cap after the rejected mint.
+    assert_eq!(
+        token.total_supply(),
+        100i128,
+        "total_supply must be unchanged after a rejected over-cap mint"
+    );
+}
+
+/// A single mint of exactly the full max_supply (starting from 0) must succeed.
+#[test]
+fn test_mint_full_max_supply_in_one_call_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let kyc_id = env.register(kyc_registry::KycRegistry, ());
+    kyc_registry::KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let ce_id = env.register(compliance_engine::ComplianceEngine, ());
+    compliance_engine::ComplianceEngineClient::new(&env, &ce_id)
+        .initialize(&admin, &kyc_id, &0u64);
+
+    // max_supply = 50
+    let token_id = env.register(
+        RwaToken,
+        (
+            admin.clone(),
+            7u32,
+            String::from_str(&env, "Full Cap"),
+            String::from_str(&env, "FCP"),
+            String::from_str(&env, "invoice"),
+            kyc_id.clone(),
+            ce_id.clone(),
+            Option::<ComplianceMetadata>::None,
+            50i128,
+        ),
+    );
+    let token = RwaTokenClient::new(&env, &token_id);
+    let kyc = kyc_registry::KycRegistryClient::new(&env, &kyc_id);
+
+    let verifier = Address::generate(&env);
+    kyc.add_verifier(&admin, &verifier);
+    let recipient = Address::generate(&env);
+    kyc.approve(
+        &verifier,
+        &recipient,
+        &1,
+        &0,
+        &String::from_str(&env, "US"),
+    );
+
+    // Mint the entire cap in one call.
+    token.mint(&admin, &recipient, &50i128);
+    assert_eq!(
+        token.total_supply(),
+        50i128,
+        "single mint of the full cap must succeed"
+    );
+
+    // One more unit must be rejected.
+    let res = token.try_mint(&admin, &recipient, &1i128);
+    assert!(res.is_err(), "any mint beyond the cap must fail");
+    assert_eq!(token.total_supply(), 50i128, "supply unchanged after rejection");
+}
