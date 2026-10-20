@@ -2434,6 +2434,130 @@ fn test_batch_transfer_11_recipients_rejected_before_validation() {
 }
 
 // ── Recovery subsystem unit tests ─────────────────────────────────────────────
+//
+// # RWA admin recovery test guide (issue #935)
+//
+// This block is a short, test-oriented guide to the recovery subsystem. It
+// describes only what the tests below already exercise; it does not change any
+// recovery logic. For the privileged-action checklist, see the "Privileged
+// actions" section of the security checklist (SECURITY.md).
+//
+// ## Fixture
+//
+// Every test starts from `setup()`, which returns a `Harness` with:
+//   - `env`        — the Soroban test environment (`mock_all_auths()` is on, so
+//                    guardian/admin auth is satisfied automatically; tests that
+//                    need real auth enforcement build their own `Env` instead).
+//   - `token`      — `RwaTokenClient` for the deployed token.
+//   - `kyc`        — `KycRegistryClient` (use `h.approve_kyc(&addr)` to KYC an
+//                    address before minting to it).
+//   - `compliance` — `ComplianceEngineClient`.
+//   - `admin`      — the initial admin address.
+//
+// `make_guardians(&h, n)` builds a `Vec<Address>` of `n` fresh guardian
+// addresses. Guardians are ordinary addresses; they only gain recovery powers
+// once passed to `configure_recovery`.
+//
+// ## Method order
+//
+//   1. `configure_recovery(&threshold, &members, &cooldown_ledgers)`
+//        Admin-only. Sets the guardian set, approval threshold, and cooldown.
+//        Also clears any active proposal.
+//   2. `propose_recovery(&guardian, &new_admin)`
+//        Guardian-only. Opens a proposal; the proposer is recorded and is NOT
+//        counted as an approval.
+//   3. `approve_recovery(&guardian)`  (repeat for other guardians)
+//        Guardian-only. Each distinct guardian may approve once; the proposer
+//        cannot approve.
+//   4. `execute_recovery(&guardian)`
+//        Guardian-only. Requires approvals >= threshold, an unexpired proposal,
+//        and the cooldown to have elapsed. Replaces the admin, bumps
+//        `admin_nonce`, records `last_executed_ledger`, and clears the proposal.
+//
+// `cancel_recovery()` (admin-only) clears an active proposal at any time.
+//
+// ## Threshold rules
+//
+//   - `threshold` must be >= 2 and <= members.len(); members must be 1..=10 and
+//     unique. Violations return `InvalidRecoveryConfig`.
+//   - A proposal is only allowed if the threshold is reachable: with the
+//     proposer excluded from approving, `threshold <= members.len() - 1`.
+//     A 3-of-3 config therefore rejects `propose_recovery`.
+//   - `execute_recovery` needs `approvals.len() >= threshold`, otherwise
+//     `InsufficientApprovals`.
+//
+// ## Proposal expiry
+//
+// A proposal expires at `proposed_ledger + cooldown_ledgers / 2`. At the expiry
+// ledger itself the proposal is still live; from `expiry + 1` it is stale:
+// `approve_recovery` returns `RecoveryExpired`, `execute_recovery` returns
+// `RecoveryExpired` (leaving admin, nonce, and `last_executed_ledger`
+// untouched), and a new `propose_recovery` may replace it.
+//
+// ## Cooldown advancement
+//
+// `cooldown_ledgers` gates how soon a second recovery may execute. Advance the
+// ledger with `h.env.ledger().set_sequence_number(n)` (or
+// `h.env.ledger().with_mut(|l| l.sequence_number = n)`). A second
+// `execute_recovery` before `last_executed_ledger + cooldown_ledgers` returns
+// `RecoveryCooldown`. Use `cooldown_ledgers = 0` when the test does not care
+// about cooldown.
+//
+// ## Principal cases already covered
+//
+// Positive:
+//   - `test_recovery_configure_and_read`
+//   - `test_recovery_propose_and_read_active`
+//   - `test_recovery_approve_increases_approval_count`
+//   - `test_recovery_execute_replaces_admin_and_bumps_nonce`
+//   - `test_recovery_new_admin_can_mint_after_recovery`
+//   - `test_approve_recovery_two_distinct_guardians_both_count`
+//
+// Negative:
+//   - `test_recovery_configure_rejects_*` (threshold, member count, duplicates)
+//   - `test_recovery_propose_rejects_while_proposal_active`
+//   - `test_recovery_propose_rejects_unreachable_threshold`
+//   - `test_recovery_proposer_cannot_approve`
+//   - `test_recovery_approve_duplicate_panics`
+//   - `test_recovery_expired_proposal_blocks_approve`
+//   - `test_recovery_execute_rejects_expired_proposal`
+//   - `test_recovery_execute_insufficient_approvals_panics`
+//   - `test_recovery_cooldown_blocks_immediate_second_execution`
+//   - `test_recovery_cancel_no_active_panics`
+//   - `test_recovery_non_guardian_propose_panics`
+//
+// ## Worked example: adding one recovery test
+//
+// To assert that a proposal cannot be executed by a non-guardian, add:
+//
+// ```ignore
+// #[test]
+// fn test_recovery_execute_rejects_non_guardian() {
+//     use crate::RwaError;
+//     use soroban_sdk::Error;
+//
+//     let h = setup();
+//     let members = make_guardians(&h, 3);
+//     let g1 = members.get(0).unwrap();
+//     let g2 = members.get(1).unwrap();
+//     h.token.configure_recovery(&2, &members, &0);
+//     h.token.propose_recovery(&g1, &Address::generate(&h.env));
+//     h.token.approve_recovery(&g2);
+//
+//     let stranger = Address::generate(&h.env);
+//     let res = h.token.try_execute_recovery(&stranger);
+//     assert_eq!(
+//         res.unwrap_err().unwrap(),
+//         Error::from(RwaError::NotRecoveryMember)
+//     );
+//     // Proposal and admin are unchanged.
+//     assert!(h.token.active_recovery().is_some());
+// }
+// ```
+//
+// Follow the same shape for new cases: build the fixture, configure, propose,
+// approve from distinct guardians, advance the ledger only when testing
+// expiry/cooldown, then assert on the typed `RwaError` via `try_*`.
 
 fn make_guardians(h: &Harness, n: usize) -> soroban_sdk::Vec<Address> {
     let mut v = soroban_sdk::Vec::new(&h.env);
