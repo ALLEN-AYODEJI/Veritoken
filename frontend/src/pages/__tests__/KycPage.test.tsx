@@ -143,4 +143,53 @@ describe("KycPage – approve form", () => {
       expect(screen.getByRole("dialog")).toBeDefined();
     });
   });
+
+  // #988 New tests for validation feedback
+  it("shows field error and blocks submission for invalid address", async () => {
+    renderKycPage();
+    const subjectInput = screen.getAllByRole("textbox").find(
+      (el) => (el as HTMLInputElement).placeholder === "G…",
+    );
+    if (!subjectInput) throw new Error("subject input not found");
+    
+    fireEvent.change(subjectInput, { target: { value: "INVALID123" } });
+    
+    await waitFor(() => {
+      const errorMessage = screen.getByRole("alert");
+      expect(errorMessage).toBeDefined();
+      expect(errorMessage.textContent).toMatch(/valid/i);
+    });
+    
+    const btn = screen.getByRole("button", { name: /Approve KYC/i });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("shows field error and blocks submission for invalid expiry value", async () => {
+    renderKycPage();
+    const subjectInput = screen.getAllByRole("textbox").find(
+      (el) => (el as HTMLInputElement).placeholder === "G…",
+    );
+    if (!subjectInput) throw new Error("subject input not found");
+    
+    fireEvent.change(subjectInput, {
+      target: {
+        value: "GBQG2SJ7MXUH34SI3MJ2I256I5UMGM2QSQZM77YFX5S6JOHXUQJEPC3A",
+      },
+    });
+
+    const expiryInput = screen.getAllByRole("spinbutton").find(
+      (el) => (el as HTMLInputElement).value === "365",
+    );
+    if (!expiryInput) throw new Error("expiry input not found");
+    
+    fireEvent.change(expiryInput, { target: { value: "-100" } });
+    
+    const btn = screen.getByRole("button", { name: /Approve KYC/i });
+    fireEvent.click(btn);
+    
+    // Should not open dialog for invalid inputs
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    }, { timeout: 500 });
+  });
 });
