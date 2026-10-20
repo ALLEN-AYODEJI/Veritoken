@@ -2234,6 +2234,90 @@ fn test_batch_settle_one_above_limit_truncates_to_ten() {
     assert!(!h.token.is_settled(&ids.get(10).unwrap()));
 }
 
+// ── #942: Invoice redemption dust conservation ────────────────────────────────
+
+#[test]
+fn test_redemption_dust_conservation_nonzero_remainder() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value = 10, issue 3 tokens, fully settle.
+    // After redeeming 3 tokens the remaining dust is 10 - 3 = 7 (nonzero).
+    let face = 10i128;
+    let issued = 3i128;
+    let inv = String::from_str(&h.env, "DUST-CONSERVE");
+    let m = InvoiceMeta {
+        invoice_id: inv.clone(),
+        issuer: String::from_str(&h.env, "Issuer"),
+        debtor: String::from_str(&h.env, "Debtor"),
+        face_value_usd: face,
+        discount_rate_bps: 0,
+        due_date: 1_900_000_000,
+        currency: String::from_str(&h.env, "USD"),
+        ipfs_doc_hash: String::from_str(&h.env, ""),
+        transfer_fee_bps: 0,
+        fee_recipient: None,
+        notification_webhook: String::from_str(&h.env, ""),
+    };
+    h.token.create_invoice(&m);
+    h.token.issue(&inv, &holder, &issued);
+    h.token.settle(&inv);
+
+    let settlement = h.token.settlement_amount(&inv);
+    assert_eq!(settlement, face);
+
+    // Dust is initialised to settlement_amount before any redemption.
+    let initial_dust = h.token.collect_redemption_dust(&inv);
+    assert_eq!(initial_dust, settlement);
+
+    // Redeem all tokens; supply drops to zero and status transitions to Redeemed.
+    h.token.redeem(&inv, &holder, &issued);
+    assert_eq!(h.token.total_supply(&inv), 0);
+    assert_eq!(h.token.invoice_status(&inv), InvoiceStatus::Redeemed);
+
+    let remaining_dust = h.token.collect_redemption_dust(&inv);
+    // Arithmetic identity: redeemed + remaining_dust == settlement_amount.
+    assert_eq!(issued + remaining_dust, settlement);
+    assert!(remaining_dust > 0, "dust must be nonzero with face=10, issued=3");
+
+    // collect_redemption_dust is read-only — calling it again yields the same value.
+    assert_eq!(h.token.collect_redemption_dust(&inv), remaining_dust);
+}
+
+#[test]
+fn test_redemption_dust_zero_when_supply_equals_settlement() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value == issued == settlement → no dust after full redemption.
+    let face = 5i128;
+    let inv = String::from_str(&h.env, "DUST-EXACT");
+    let m = InvoiceMeta {
+        invoice_id: inv.clone(),
+        issuer: String::from_str(&h.env, "Issuer"),
+        debtor: String::from_str(&h.env, "Debtor"),
+        face_value_usd: face,
+        discount_rate_bps: 0,
+        due_date: 1_900_000_000,
+        currency: String::from_str(&h.env, "USD"),
+        ipfs_doc_hash: String::from_str(&h.env, ""),
+        transfer_fee_bps: 0,
+        fee_recipient: None,
+        notification_webhook: String::from_str(&h.env, ""),
+    };
+    h.token.create_invoice(&m);
+    h.token.issue(&inv, &holder, &face);
+    h.token.settle(&inv);
+
+    h.token.redeem(&inv, &holder, &face);
+    let dust = h.token.collect_redemption_dust(&inv);
+    // Conservation holds with zero dust: face + 0 == settlement.
+    assert_eq!(face + dust, h.token.settlement_amount(&inv));
+    assert_eq!(dust, 0);
+}
+
 // Fix #847 — append_journal_entry: reject empty event tags
 // Before the fix, there was no public append_journal_entry entry point.
 // A journal entry recorded without a meaningful tag would make the lifecycle
