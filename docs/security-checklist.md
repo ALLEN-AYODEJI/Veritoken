@@ -60,6 +60,13 @@ fix.
 - [ ] The `AlreadyInitialized` guard prevents a second initialization call from
   replacing the admin after deployment.
 
+### Admin recovery (RWA tokens)
+
+- [ ] Recovery configuration and voting follow the documented method order and
+  authorization rules. For the recovery test fixture, threshold rules, cooldown
+  advancement, and the principal positive/negative cases, see
+  [rwa-recovery-test-guide.md](rwa-recovery-test-guide.md).
+
 ---
 
 ## 2. Storage Safety

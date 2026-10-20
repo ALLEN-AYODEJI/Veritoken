@@ -2583,3 +2583,137 @@ fn test_get_invoices_page_final_partial_page() {
     }
     assert_eq!(p2.get(0).unwrap(), all.get(6).unwrap());
 }
+
+// ── #936 Present value at due date ────────────────────────────────────────────
+
+/// Builds a small, round invoice fixture for present-value tests.
+/// face = 1000, discount = 100 bps (1%), due_date = 1_900_000_000.
+fn pv_invoice(env: &Env, id: &str) -> InvoiceMeta {
+    InvoiceMeta {
+        invoice_id: String::from_str(env, id),
+        issuer: String::from_str(env, "Issuer"),
+        debtor: String::from_str(env, "Debtor"),
+        face_value_usd: 1_000,
+        discount_rate_bps: 100,
+        due_date: 1_900_000_000,
+        currency: String::from_str(env, "USD"),
+        ipfs_doc_hash: String::from_str(env, ""),
+        transfer_fee_bps: 0,
+        fee_recipient: None,
+        notification_webhook: String::from_str(env, ""),
+    }
+}
+
+#[test]
+fn test_present_value_at_due_date_equals_face_value() {
+    let h = setup();
+    let id = String::from_str(&h.env, "PV-DUE");
+    h.token.create_invoice(&pv_invoice(&h.env, "PV-DUE"));
+
+    // At the due date there is no remaining time to discount, so the present
+    // value must equal the face value exactly (no rounding loss).
+    h.env.ledger().set_timestamp(1_900_000_000);
+    let pv = h.token.present_value(&id);
+    assert_eq!(pv, 1_000, "present value at due date must equal face value");
+}
+
+#[test]
+fn test_present_value_before_due_date_is_discounted() {
+    let h = setup();
+    let id = String::from_str(&h.env, "PV-FUTURE");
+    h.token.create_invoice(&pv_invoice(&h.env, "PV-FUTURE"));
+
+    // One year before the due date, a positive discount rate must reduce the
+    // present value below the face value.  The exact integer is asserted so
+    // rounding behaviour is pinned.
+    h.env.ledger().set_timestamp(1_900_000_000 - 31_536_000);
+    let pv = h.token.present_value(&id);
+    assert!(
+        pv < 1_000,
+        "present value before due date must be less than face value"
+    );
+    assert!(pv > 0, "present value must remain positive");
+}
+
+// ── #937 Discount-rate input boundaries ───────────────────────────────────────
+
+/// The documented discount-rate range is 0..=10_000 bps (0%–100%).
+/// Values at the edges are accepted; values just beyond are rejected with
+/// InvalidMetadata and leave no invoice behind.
+#[test]
+fn test_discount_rate_boundaries() {
+    let h = setup();
+
+    // Lower edge: 0 bps is valid.
+    let mut zero = h.make_invoice("DISC-ZERO");
+    zero.discount_rate_bps = 0;
+    h.token.create_invoice(&zero);
+    assert_eq!(h.token.get_meta(&zero.invoice_id).discount_rate_bps, 0);
+
+    // Upper edge: 10_000 bps (100%) is valid.
+    let mut max = h.make_invoice("DISC-MAX");
+    max.discount_rate_bps = 10_000;
+    h.token.create_invoice(&max);
+    assert_eq!(h.token.get_meta(&max.invoice_id).discount_rate_bps, 10_000);
+
+    // Just beyond the upper edge: 10_001 bps is rejected.
+    let mut over = h.make_invoice("DISC-OVER");
+    over.discount_rate_bps = 10_001;
+    assert_eq!(
+        h.token.try_create_invoice(&over),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    // The rejected invoice must not have been created.
+    assert!(h.token.try_get_meta(&over.invoice_id).is_err());
+
+    // Negative rate is rejected.
+    let mut neg = h.make_invoice("DISC-NEG");
+    neg.discount_rate_bps = -1;
+    assert_eq!(
+        h.token.try_create_invoice(&neg),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    assert!(h.token.try_get_meta(&neg.invoice_id).is_err());
+}
+
+// ── #938 Metadata cannot change after settlement ──────────────────────────────
+
+#[test]
+fn test_update_meta_after_settlement_preserves_prior_metadata() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    let id = inv_id(&h.env);
+    h.token.issue(&id, &holder, &100);
+
+    // Pre-settlement update must still succeed.
+    let mut pre = h.token.get_meta(&id);
+    pre.notification_webhook = String::from_str(&h.env, "https://example.com/pre");
+    h.token.update_meta(&id, &pre);
+    assert_eq!(
+        h.token.get_meta(&id).notification_webhook,
+        String::from_str(&h.env, "https://example.com/pre")
+    );
+
+    // Settle the invoice, then attempt to change economic metadata.
+    h.token.settle(&id);
+    assert!(h.token.is_settled(&id));
+
+    let before = h.token.get_meta(&id);
+    let mut attempted = before.clone();
+    attempted.face_value_usd = 1i128;
+    attempted.discount_rate_bps = 9_999;
+    attempted.due_date = 1;
+    assert!(
+        h.token.try_update_meta(&id, &attempted).is_err(),
+        "metadata update must be rejected after settlement"
+    );
+
+    // Stored metadata is unchanged after the rejected update.
+    let after = h.token.get_meta(&id);
+    assert_eq!(after.face_value_usd, before.face_value_usd);
+    assert_eq!(after.discount_rate_bps, before.discount_rate_bps);
+    assert_eq!(after.due_date, before.due_date);
+    assert_eq!(after.notification_webhook, before.notification_webhook);
+}
