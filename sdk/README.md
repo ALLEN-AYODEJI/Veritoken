@@ -181,8 +181,13 @@ const clients = createClients({
 // `undefined` because no contract ID was given for them.
 ```
 
+An entirely empty `contractIds: {}` (with no `overrides`) is accepted: it
+returns `{}`, every client is `undefined`, and no RPC call is made.
+
 `ClientFactory` wraps the same thing with typed, fail-fast accessors — useful
-when a missing client should be a loud error instead of `undefined`:
+when a missing client should be a loud error instead of `undefined`. Its
+constructor throws on an empty configuration, and `get()` throws
+synchronously with an error naming the missing client:
 
 ```ts
 import { ClientFactory } from "@veritoken/sdk";

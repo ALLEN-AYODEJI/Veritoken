@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { Networks, rpc } from "@stellar/stellar-sdk";
 import {
   resolveNetworkConfig,
@@ -218,6 +218,137 @@ describe("resolveNetworkConfig", () => {
     const config = resolveNetworkConfig({ network: "my-private-devnet" });
     expect(config.rpcUrl).toBe("https://rpc.from-env.internal");
     expect(config.networkPassphrase).toBe("From Env ; 2026");
+  });
+});
+
+// ── Custom network validation combinations — #973 ─────────────────────────────
+
+describe("custom network validation combinations", () => {
+  const CUSTOM_NETWORK = "my-private-devnet";
+  const CUSTOM_RPC_URL = "https://rpc.my-devnet.internal";
+  const CUSTOM_PASSPHRASE = "My Private Devnet ; 2026";
+
+  // Env vars could otherwise supply the missing half of the pair.
+  beforeEach(() => {
+    clearEnv();
+  });
+
+  it("rejects a custom network configured with only an RPC URL, before any server is created", () => {
+    const overrides = { network: CUSTOM_NETWORK, rpcUrl: CUSTOM_RPC_URL };
+    expect(() => resolveNetworkConfig(overrides)).toThrow(InvalidNetworkConfigError);
+    expect(() => createServer(overrides)).toThrow(InvalidNetworkConfigError);
+  });
+
+  it("rejects a custom network configured with only a passphrase, before any server is created", () => {
+    const overrides = { network: CUSTOM_NETWORK, networkPassphrase: CUSTOM_PASSPHRASE };
+    expect(() => resolveNetworkConfig(overrides)).toThrow(InvalidNetworkConfigError);
+    expect(() => createServer(overrides)).toThrow(InvalidNetworkConfigError);
+  });
+
+  it("resolves every field when both the RPC URL and passphrase are supplied", () => {
+    const overrides = {
+      network: CUSTOM_NETWORK,
+      rpcUrl: CUSTOM_RPC_URL,
+      networkPassphrase: CUSTOM_PASSPHRASE,
+    };
+    expect(resolveNetworkConfig(overrides)).toEqual({
+      network: CUSTOM_NETWORK,
+      rpcUrl: CUSTOM_RPC_URL,
+      networkPassphrase: CUSTOM_PASSPHRASE,
+      allowHttp: false,
+    });
+    expect(createServer(overrides)).toBeInstanceOf(rpc.Server);
+  });
+
+  it("leaves built-in network defaults unchanged", () => {
+    resolveNetworkConfig({
+      network: CUSTOM_NETWORK,
+      rpcUrl: CUSTOM_RPC_URL,
+      networkPassphrase: CUSTOM_PASSPHRASE,
+    });
+    for (const network of KNOWN_NETWORKS) {
+      expect(resolveNetworkConfig({ network })).toEqual({
+        network,
+        rpcUrl: RPC_URLS[network],
+        networkPassphrase: NETWORK_PASSPHRASES[network],
+        allowHttp: network === "standalone",
+      });
+    }
+    expect(NETWORK_PASSPHRASES).toEqual({
+      testnet: Networks.TESTNET,
+      mainnet: Networks.PUBLIC,
+      futurenet: Networks.FUTURENET,
+      standalone: Networks.STANDALONE,
+    });
+  });
+});
+
+// ── Plaintext RPC override safety — #974 ──────────────────────────────────────
+
+describe("plaintext RPC override safety", () => {
+  const HTTP_RPC_URL = "http://rpc.example.com/soroban/rpc";
+  const HTTPS_RPC_URL = "https://rpc.example.com/soroban/rpc";
+
+  // No test here relies on an environment variable; clear them so a developer's
+  // VERITOKEN_RPC_ALLOW_HTTP can't change the defaults under test.
+  beforeEach(() => {
+    clearEnv();
+  });
+
+  it("accepts plain HTTP for standalone without an explicit override", () => {
+    const byDefault = resolveNetworkConfig({ network: "standalone" });
+    expect(byDefault.rpcUrl.startsWith("http://")).toBe(true);
+    expect(byDefault.allowHttp).toBe(true);
+
+    const custom = resolveNetworkConfig({ network: "standalone", rpcUrl: HTTP_RPC_URL });
+    expect(custom.rpcUrl).toBe(HTTP_RPC_URL);
+    expect(custom.allowHttp).toBe(true);
+    expect(createServer(custom)).toBeInstanceOf(rpc.Server);
+  });
+
+  it("rejects plain HTTP for the public network with InvalidNetworkConfigError", () => {
+    expect(() => resolveNetworkConfig({ network: "mainnet", rpcUrl: HTTP_RPC_URL })).toThrow(
+      InvalidNetworkConfigError,
+    );
+    expect(() =>
+      resolveNetworkConfig({ network: "mainnet", rpcUrl: HTTP_RPC_URL, allowHttp: false }),
+    ).toThrow(InvalidNetworkConfigError);
+    expect(() => createServer({ network: "mainnet", rpcUrl: HTTP_RPC_URL })).toThrow(
+      InvalidNetworkConfigError,
+    );
+  });
+
+  it("allows plain HTTP on the public network only with an explicit allowHttp: true", () => {
+    const config = resolveNetworkConfig({ network: "mainnet", rpcUrl: HTTP_RPC_URL, allowHttp: true });
+    expect(config).toEqual({
+      network: "mainnet",
+      rpcUrl: HTTP_RPC_URL,
+      networkPassphrase: Networks.PUBLIC,
+      allowHttp: true,
+    });
+    expect(createServer(config)).toBeInstanceOf(rpc.Server);
+  });
+
+  it("rejects plain HTTP for standalone when allowHttp is explicitly false", () => {
+    expect(() => resolveNetworkConfig({ network: "standalone", allowHttp: false })).toThrow(
+      InvalidNetworkConfigError,
+    );
+    expect(() =>
+      resolveNetworkConfig({ network: "standalone", rpcUrl: HTTP_RPC_URL, allowHttp: false }),
+    ).toThrow(InvalidNetworkConfigError);
+  });
+
+  it("keeps HTTPS working regardless of allowHttp", () => {
+    for (const allowHttp of [undefined, false, true]) {
+      const mainnet = resolveNetworkConfig({ network: "mainnet", allowHttp });
+      expect(mainnet.rpcUrl).toBe(RPC_URLS.mainnet);
+      expect(mainnet.rpcUrl.startsWith("https://")).toBe(true);
+      expect(createServer(mainnet)).toBeInstanceOf(rpc.Server);
+
+      const standalone = resolveNetworkConfig({ network: "standalone", rpcUrl: HTTPS_RPC_URL, allowHttp });
+      expect(standalone.rpcUrl).toBe(HTTPS_RPC_URL);
+      expect(createServer(standalone)).toBeInstanceOf(rpc.Server);
+    }
   });
 });
 

@@ -105,7 +105,9 @@ export interface CreateClientsConfig {
  * Build every contract client implied by `config.contractIds` (or supplied
  * via `config.overrides`), sharing one RPC server and network passphrase.
  * Keys absent from both `contractIds` and `overrides` are omitted from the
- * result.
+ * result. An empty `contractIds` with no `overrides` is not an error: it
+ * returns `{}`, so every client is `undefined`, and makes no RPC calls. Use
+ * `ClientFactory` when an empty configuration should fail instead.
  */
 export function createClients(config: CreateClientsConfig): Partial<ClientMap> {
   const resolved = resolveNetworkConfig({
