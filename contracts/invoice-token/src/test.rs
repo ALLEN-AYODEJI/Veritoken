@@ -2117,6 +2117,47 @@ fn test_partial_invoice_settlement_arithmetic() {
     assert!(h.token.try_settle(&inv_id(&h.env)).is_err());
 }
 
+// ── #940: Batch settlement per-item result ordering ───────────────────────────
+
+#[test]
+fn test_batch_settle_mixed_per_item_results() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    let id_ok = String::from_str(&h.env, "MIXED-OK");
+    let id_missing = String::from_str(&h.env, "MIXED-MISSING");
+
+    h.token.create_invoice(&h.make_invoice("MIXED-OK"));
+    h.token.issue(&id_ok, &holder, &10);
+    // id_missing is never created — it does not exist in storage.
+
+    let settlements = {
+        let mut v = soroban_sdk::Vec::new(&h.env);
+        v.push_back((id_ok.clone(), 100_000_000_000i128));
+        v.push_back((id_missing.clone(), 100_000_000_000i128));
+        v
+    };
+
+    let results = h.token.batch_settle(&settlements);
+    assert_eq!(results.len(), 2);
+
+    // First result corresponds to id_ok in submission order and must succeed.
+    let r0 = results.get(0).unwrap();
+    assert_eq!(r0.invoice_id, id_ok);
+    assert!(r0.error.is_none());
+
+    // Second result corresponds to id_missing and must carry InvoiceNotFound (13).
+    let r1 = results.get(1).unwrap();
+    assert_eq!(r1.invoice_id, id_missing);
+    assert!(r1.error.is_some());
+    assert_eq!(r1.error.unwrap(), InvoiceError::InvoiceNotFound as u32);
+
+    // State: id_ok is settled; id_missing never existed.
+    assert!(h.token.is_settled(&id_ok));
+    assert!(h.token.try_get_meta(&id_missing).is_err());
+}
+
 // Fix #847 — append_journal_entry: reject empty event tags
 // Before the fix, there was no public append_journal_entry entry point.
 // A journal entry recorded without a meaningful tag would make the lifecycle
