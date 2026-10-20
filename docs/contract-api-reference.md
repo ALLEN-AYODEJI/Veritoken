@@ -416,6 +416,22 @@ burn_from(env, spender: Address, from: Address, amount: i128)
 ```
 Every `transfer` and `transfer_from` call checks KYC and compliance before any balance change. A reentrancy guard prevents nested transfers.
 
+##### Transfer enforcement call order
+
+Both `transfer` and `transfer_from` funnel into the same internal helper, so the enforcement sequence is identical apart from caller authorization and the allowance spend. The checks run in this exact order:
+
+1. **Amount validation** — a non-positive amount fails with `NegativeAmount`.
+2. **Reentrancy guard** — the guard is acquired; a nested transfer attempt is rejected.
+3. **Delegated authorization (only for `transfer_from`)** — `spender.require_auth()` is called, then the `from → spender` allowance is checked for existence, sufficiency (`InsufficientAllowance`), and expiry (`AllowanceExpired`). Direct `transfer` skips this step and instead authorizes the `from` address via `from.require_auth()`.
+4. **Token-level frozen checks** — `from` and `to` are checked against the per-account freeze flag; either being frozen fails with `AccountFrozen`.
+5. **KYC / compliance gate** — `compliance::check_transfer` is invoked, which calls the compliance engine's `evaluate_transfer`. A KYC-related denial maps to `KycNotApproved`; any other compliance denial maps to `TransferBlocked`. This gate runs for both direct and delegated transfers and cannot be skipped.
+6. **Holder capacity check** — if `to` is a new holder, the engine's holder cap is enforced.
+7. **Balance mutation and event emission** — balances are updated and the SEP-41 transfer event is emitted.
+8. **Allowance spend (only for `transfer_from`)** — the spent amount is deducted from the `from → spender` allowance.
+9. **Reentrancy guard release** — the guard is cleared on exit.
+
+**Authorization summary:** direct `transfer` authorizes `from`; delegated `transfer_from` authorizes `spender` and spends `from`'s allowance. In both flows the compliance gate (step 5) is mandatory — delegation changes who authorizes the call, never whether compliance is enforced.
+
 ---
 
 #### Batch transfers
