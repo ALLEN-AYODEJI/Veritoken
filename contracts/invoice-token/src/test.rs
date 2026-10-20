@@ -2062,6 +2062,262 @@ fn test_create_invoice_non_empty_id_accepted() {
     assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
 }
 
+// ── #939: Partial invoice settlement arithmetic ───────────────────────────────
+
+#[test]
+fn test_partial_invoice_settlement_arithmetic() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value = 1_000_000_000_000, issue 10 tokens.
+    h.token.issue(&inv_id(&h.env), &holder, &10);
+
+    let face = 1_000_000_000_000i128;
+
+    // Step 1: first partial payment (30% of face) → PartiallySettled.
+    let first_payment = face * 30 / 100;
+    h.token.partial_settle(&inv_id(&h.env), &first_payment);
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::PartiallySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), first_payment);
+
+    // Step 2: second partial_settle attempt is rejected (already PartiallySettled).
+    let second_payment = face * 50 / 100;
+    assert!(h
+        .token
+        .try_partial_settle(&inv_id(&h.env), &second_payment)
+        .is_err());
+    // Status and amount are unchanged after the failed attempt.
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::PartiallySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), first_payment);
+
+    // Step 3: settle() upgrades to FullySettled and replaces settlement_amount with face.
+    h.token.settle(&inv_id(&h.env));
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::FullySettled
+    );
+    assert_eq!(h.token.settlement_amount(&inv_id(&h.env)), face);
+
+    // Redeem all 10 tokens — supply goes to zero, status becomes Redeemed (terminal).
+    h.token.redeem(&inv_id(&h.env), &holder, &10);
+    assert_eq!(
+        h.token.invoice_status(&inv_id(&h.env)),
+        InvoiceStatus::Redeemed
+    );
+    assert_eq!(h.token.total_supply(&inv_id(&h.env)), 0);
+
+    // Further settlement on a Redeemed invoice must be rejected.
+    assert!(h.token.try_settle(&inv_id(&h.env)).is_err());
+}
+
+// ── #940: Batch settlement per-item result ordering ───────────────────────────
+
+#[test]
+fn test_batch_settle_mixed_per_item_results() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    let id_ok = String::from_str(&h.env, "MIXED-OK");
+    let id_missing = String::from_str(&h.env, "MIXED-MISSING");
+
+    h.token.create_invoice(&h.make_invoice("MIXED-OK"));
+    h.token.issue(&id_ok, &holder, &10);
+    // id_missing is never created — it does not exist in storage.
+
+    let settlements = {
+        let mut v = soroban_sdk::Vec::new(&h.env);
+        v.push_back((id_ok.clone(), 100_000_000_000i128));
+        v.push_back((id_missing.clone(), 100_000_000_000i128));
+        v
+    };
+
+    let results = h.token.batch_settle(&settlements);
+    assert_eq!(results.len(), 2);
+
+    // First result corresponds to id_ok in submission order and must succeed.
+    let r0 = results.get(0).unwrap();
+    assert_eq!(r0.invoice_id, id_ok);
+    assert!(r0.error.is_none());
+
+    // Second result corresponds to id_missing and must carry InvoiceNotFound (13).
+    let r1 = results.get(1).unwrap();
+    assert_eq!(r1.invoice_id, id_missing);
+    assert!(r1.error.is_some());
+    assert_eq!(r1.error.unwrap(), InvoiceError::InvoiceNotFound as u32);
+
+    // State: id_ok is settled; id_missing never existed.
+    assert!(h.token.is_settled(&id_ok));
+    assert!(h.token.try_get_meta(&id_missing).is_err());
+}
+
+// ── #941: Empty and maximum invoice settlement batches ────────────────────────
+
+#[test]
+fn test_batch_settle_empty_input_returns_no_results() {
+    let h = setup();
+    let empty: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    let results = h.token.batch_settle(&empty);
+    assert_eq!(results.len(), 0);
+}
+
+#[test]
+fn test_batch_settle_exactly_at_limit_processes_all() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // Create and issue exactly 10 invoices (the cap).
+    let raw_ids = [
+        "LIM-00", "LIM-01", "LIM-02", "LIM-03", "LIM-04", "LIM-05", "LIM-06", "LIM-07",
+        "LIM-08", "LIM-09",
+    ];
+    let mut ids: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&h.env);
+    for raw in raw_ids.iter() {
+        let id = String::from_str(&h.env, raw);
+        h.token.create_invoice(&h.make_invoice(raw));
+        h.token.issue(&id, &holder, &10);
+        ids.push_back(id);
+    }
+
+    let mut settlements: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    for i in 0..10u32 {
+        settlements.push_back((ids.get(i).unwrap(), 200_000_000_000i128));
+    }
+
+    let results = h.token.batch_settle(&settlements);
+    // All 10 must be processed with no truncation.
+    assert_eq!(results.len(), 10);
+    for i in 0..10u32 {
+        assert!(
+            results.get(i).unwrap().error.is_none(),
+            "invoice {i} should succeed"
+        );
+    }
+}
+
+#[test]
+fn test_batch_settle_one_above_limit_truncates_to_ten() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // Create 11 invoices; the 11th must not be processed.
+    let raw_ids = [
+        "OVR-00", "OVR-01", "OVR-02", "OVR-03", "OVR-04", "OVR-05", "OVR-06", "OVR-07",
+        "OVR-08", "OVR-09", "OVR-10",
+    ];
+    let mut ids: soroban_sdk::Vec<String> = soroban_sdk::Vec::new(&h.env);
+    for raw in raw_ids.iter() {
+        let id = String::from_str(&h.env, raw);
+        h.token.create_invoice(&h.make_invoice(raw));
+        h.token.issue(&id, &holder, &10);
+        ids.push_back(id);
+    }
+
+    let mut settlements: soroban_sdk::Vec<(String, i128)> = soroban_sdk::Vec::new(&h.env);
+    for i in 0..11u32 {
+        settlements.push_back((ids.get(i).unwrap(), 200_000_000_000i128));
+    }
+
+    let results = h.token.batch_settle(&settlements);
+    assert_eq!(results.len(), 10);
+
+    // The 11th invoice (index 10) was not processed — it remains unsettled.
+    assert!(!h.token.is_settled(&ids.get(10).unwrap()));
+}
+
+// ── #942: Invoice redemption dust conservation ────────────────────────────────
+
+#[test]
+fn test_redemption_dust_conservation_nonzero_remainder() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value = 10, issue 3 tokens, fully settle.
+    // After redeeming 3 tokens the remaining dust is 10 - 3 = 7 (nonzero).
+    let face = 10i128;
+    let issued = 3i128;
+    let inv = String::from_str(&h.env, "DUST-CONSERVE");
+    let m = InvoiceMeta {
+        invoice_id: inv.clone(),
+        issuer: String::from_str(&h.env, "Issuer"),
+        debtor: String::from_str(&h.env, "Debtor"),
+        face_value_usd: face,
+        discount_rate_bps: 0,
+        due_date: 1_900_000_000,
+        currency: String::from_str(&h.env, "USD"),
+        ipfs_doc_hash: String::from_str(&h.env, ""),
+        transfer_fee_bps: 0,
+        fee_recipient: None,
+        notification_webhook: String::from_str(&h.env, ""),
+    };
+    h.token.create_invoice(&m);
+    h.token.issue(&inv, &holder, &issued);
+    h.token.settle(&inv);
+
+    let settlement = h.token.settlement_amount(&inv);
+    assert_eq!(settlement, face);
+
+    // Dust is initialised to settlement_amount before any redemption.
+    let initial_dust = h.token.collect_redemption_dust(&inv);
+    assert_eq!(initial_dust, settlement);
+
+    // Redeem all tokens; supply drops to zero and status transitions to Redeemed.
+    h.token.redeem(&inv, &holder, &issued);
+    assert_eq!(h.token.total_supply(&inv), 0);
+    assert_eq!(h.token.invoice_status(&inv), InvoiceStatus::Redeemed);
+
+    let remaining_dust = h.token.collect_redemption_dust(&inv);
+    // Arithmetic identity: redeemed + remaining_dust == settlement_amount.
+    assert_eq!(issued + remaining_dust, settlement);
+    assert!(remaining_dust > 0, "dust must be nonzero with face=10, issued=3");
+
+    // collect_redemption_dust is read-only — calling it again yields the same value.
+    assert_eq!(h.token.collect_redemption_dust(&inv), remaining_dust);
+}
+
+#[test]
+fn test_redemption_dust_zero_when_supply_equals_settlement() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    // face_value == issued == settlement → no dust after full redemption.
+    let face = 5i128;
+    let inv = String::from_str(&h.env, "DUST-EXACT");
+    let m = InvoiceMeta {
+        invoice_id: inv.clone(),
+        issuer: String::from_str(&h.env, "Issuer"),
+        debtor: String::from_str(&h.env, "Debtor"),
+        face_value_usd: face,
+        discount_rate_bps: 0,
+        due_date: 1_900_000_000,
+        currency: String::from_str(&h.env, "USD"),
+        ipfs_doc_hash: String::from_str(&h.env, ""),
+        transfer_fee_bps: 0,
+        fee_recipient: None,
+        notification_webhook: String::from_str(&h.env, ""),
+    };
+    h.token.create_invoice(&m);
+    h.token.issue(&inv, &holder, &face);
+    h.token.settle(&inv);
+
+    h.token.redeem(&inv, &holder, &face);
+    let dust = h.token.collect_redemption_dust(&inv);
+    // Conservation holds with zero dust: face + 0 == settlement.
+    assert_eq!(face + dust, h.token.settlement_amount(&inv));
+    assert_eq!(dust, 0);
+}
+
 // Fix #847 — append_journal_entry: reject empty event tags
 // Before the fix, there was no public append_journal_entry entry point.
 // A journal entry recorded without a meaningful tag would make the lifecycle
