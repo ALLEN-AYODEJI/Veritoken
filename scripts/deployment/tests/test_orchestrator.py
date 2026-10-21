@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from unittest import mock
 
 from deployment.models import (
     DeploymentConfig,
@@ -315,6 +317,126 @@ class DeploymentOrchestratorTest(unittest.TestCase):
         )
         self.assertTrue(partial_manifest_path(self.manifest_path).exists())
         self.assertEqual(load_json_object(self.report_path)["status"], "failed")
+
+    def test_resume_skips_completed_stage_and_starts_at_first_incomplete(
+        self,
+    ) -> None:
+        client = FakeStellarClient()
+        original_upload = client.upload_wasm
+
+        def fail_asset_upload(
+            artifact: Path, identity: str, network: NetworkConfig
+        ) -> str:
+            if artifact.name == "asset.wasm":
+                raise DeploymentError("fixture asset upload failure")
+            return original_upload(artifact, identity, network)
+
+        client.upload_wasm = fail_asset_upload  # type: ignore[method-assign]
+        orchestrator = DeploymentOrchestrator(client, now=self.fixed_now)
+        kwargs = {
+            "config": self.config,
+            "repo_root": self.root,
+            "wasm_dir": self.wasm_dir,
+            "identity": "fixture",
+            "network": self.network,
+            "manifest_path": self.manifest_path,
+            "report_path": self.report_path,
+            "frontend_env_path": self.frontend_env,
+        }
+
+        with self.assertRaisesRegex(DeploymentError, "fixture asset upload"):
+            orchestrator.deploy(**kwargs)
+        partial = load_json_object(partial_manifest_path(self.manifest_path))
+        registry_id = partial["contracts"]["registry"]["contract_id"]
+        self.assertEqual(partial["contracts"]["registry"]["stage"], "initialized")
+        self.assertEqual(partial["contracts"]["asset"]["stage"], "pending")
+
+        client.upload_wasm = original_upload  # type: ignore[method-assign]
+        client.calls.clear()
+        manifest, _ = orchestrator.deploy(**kwargs, resume=True)
+
+        mutating = [
+            call for call in client.calls if call[0] in {"upload", "deploy", "invoke"}
+        ]
+        self.assertEqual(mutating[0][:2], ("upload", "asset.wasm"))
+        self.assertEqual(mutating[1][0], "deploy")
+        self.assertFalse(
+            any(call[0] == "upload" and call[1] == "registry.wasm" for call in mutating)
+        )
+        self.assertEqual(sum(call[0] == "deploy" for call in mutating), 1)
+        self.assertFalse(
+            any(
+                call[0] == "invoke" and call[2] == "initialize"
+                for call in mutating
+            )
+        )
+        self.assertEqual(manifest["contracts"]["registry"]["contract_id"], registry_id)
+        self.assertEqual(
+            manifest["contracts"]["asset"]["resolved_dependencies"]["registry"],
+            registry_id,
+        )
+        self.assertEqual(manifest["status"], "verified")
+
+    def test_failed_stage_command_preserves_previous_manifest(self) -> None:
+        client = FakeStellarClient()
+        orchestrator = DeploymentOrchestrator(client, now=self.fixed_now)
+        kwargs = {
+            "config": self.config,
+            "repo_root": self.root,
+            "wasm_dir": self.wasm_dir,
+            "identity": "fixture",
+            "network": self.network,
+            "manifest_path": self.manifest_path,
+            "report_path": self.report_path,
+            "frontend_env_path": self.frontend_env,
+        }
+        orchestrator.deploy(**kwargs)
+        original_bytes = self.manifest_path.read_bytes()
+        original_data = load_json_object(self.manifest_path)
+
+        def failing_deploy(*args: Any, **kwargs: Any) -> str:
+            raise DeploymentError("fixture contract deploy command failed")
+
+        client.deploy_contract = failing_deploy  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeploymentError, "deploy command failed"):
+            orchestrator.deploy(**kwargs)
+
+        self.assertEqual(self.manifest_path.read_bytes(), original_bytes)
+        self.assertEqual(load_json_object(self.manifest_path), original_data)
+        self.assertEqual(original_data["status"], "verified")
+        self.assertTrue(partial_manifest_path(self.manifest_path).exists())
+
+    def test_failed_manifest_write_preserves_previous_manifest(self) -> None:
+        client = FakeStellarClient()
+        orchestrator = DeploymentOrchestrator(client, now=self.fixed_now)
+        kwargs = {
+            "config": self.config,
+            "repo_root": self.root,
+            "wasm_dir": self.wasm_dir,
+            "identity": "fixture",
+            "network": self.network,
+            "manifest_path": self.manifest_path,
+            "report_path": self.report_path,
+            "frontend_env_path": self.frontend_env,
+        }
+        orchestrator.deploy(**kwargs)
+        original_bytes = self.manifest_path.read_bytes()
+        manifest_path = self.manifest_path
+        real_replace = os.replace
+
+        def failing_replace(src: Any, dst: Any) -> None:
+            if Path(dst) == manifest_path:
+                raise OSError("fixture manifest replace failure")
+            real_replace(src, dst)
+
+        with mock.patch("deployment.models.os.replace", side_effect=failing_replace):
+            with self.assertRaisesRegex(OSError, "manifest replace failure"):
+                orchestrator.deploy(**kwargs)
+
+        self.assertEqual(self.manifest_path.read_bytes(), original_bytes)
+        self.assertEqual(load_json_object(self.manifest_path)["status"], "verified")
+        leftovers = list(self.root.glob(f".{self.manifest_path.name}.*.tmp"))
+        self.assertEqual(leftovers, [])
 
     def test_missing_artifact_is_reported_before_upload(self) -> None:
         (self.wasm_dir / "asset.wasm").unlink()

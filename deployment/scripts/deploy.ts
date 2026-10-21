@@ -27,6 +27,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
 import {
   Keypair,
   SorobanRpc,
@@ -40,13 +41,24 @@ import {
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const DEPLOYER_SECRET = requireEnv("DEPLOYER_SECRET");
-const RPC_URL = requireEnv("STELLAR_RPC_URL");
-const NETWORK_PASSPHRASE =
-  process.env.STELLAR_NETWORK_PASSPHRASE ?? Networks.TESTNET;
-const WASM_DIR = requireEnv("WASM_DIR");
-const CONFIG_FILE = requireEnv("CONFIG_FILE");
-const MANIFEST_OUT = requireEnv("MANIFEST_OUT");
+// Populated by loadEnv() when the script runs, so the exported helpers can be
+// imported by tests without deployment credentials in the environment.
+let DEPLOYER_SECRET: string;
+let RPC_URL: string;
+let NETWORK_PASSPHRASE: string;
+let WASM_DIR: string;
+let CONFIG_FILE: string;
+let MANIFEST_OUT: string;
+
+function loadEnv(): void {
+  DEPLOYER_SECRET = requireEnv("DEPLOYER_SECRET");
+  RPC_URL = requireEnv("STELLAR_RPC_URL");
+  NETWORK_PASSPHRASE =
+    process.env.STELLAR_NETWORK_PASSPHRASE ?? Networks.TESTNET;
+  WASM_DIR = requireEnv("WASM_DIR");
+  CONFIG_FILE = requireEnv("CONFIG_FILE");
+  MANIFEST_OUT = requireEnv("MANIFEST_OUT");
+}
 
 function requireEnv(key: string): string {
   const value = process.env[key];
@@ -385,6 +397,7 @@ async function initializeContract(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  loadEnv();
   console.log("=== Veritoken Deployment Script ===");
   console.log(`RPC URL:        ${RPC_URL}`);
   console.log(`Config:         ${CONFIG_FILE}`);
@@ -532,7 +545,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error("\nDeployment failed:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error("\nDeployment failed:", err);
+    process.exit(1);
+  });
+}
