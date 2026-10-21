@@ -66,4 +66,20 @@ describe("CopyButton", () => {
 
     expect(btn.textContent).toBe("Copy");
   });
+
+  it("does not show success when clipboard write is rejected", async () => {
+    vi.mocked(navigator.clipboard.writeText).mockRejectedValueOnce(new Error("Permission denied"));
+
+    render(<CopyButton text="test" />);
+    const btn = screen.getByRole("button");
+
+    expect(btn.textContent).toBe("Copy");
+
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+
+    expect(btn.textContent).toBe("Copy");
+    expect(btn.textContent).not.toBe("Copied!");
+  });
 });

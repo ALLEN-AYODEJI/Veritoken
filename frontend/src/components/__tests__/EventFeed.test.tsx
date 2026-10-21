@@ -89,4 +89,29 @@ describe("EventFeed", () => {
     render(<EventFeed events={[]} loading={false} />);
     expect(screen.getByText("No recent events found.")).toBeDefined();
   });
+
+  it("shows clear non-error empty state message", () => {
+    render(<EventFeed events={[]} loading={false} />);
+    
+    const emptyState = screen.getByRole("status");
+    expect(emptyState).toBeDefined();
+    
+    expect(screen.getByText("No recent events found.")).toBeDefined();
+    expect(screen.getByText("Events will appear here once contract activity occurs.")).toBeDefined();
+  });
+
+  it("does not render event rows when events array is empty", () => {
+    const { container } = render(<EventFeed events={[]} loading={false} />);
+    const rows = container.querySelectorAll("tbody tr");
+    expect(rows.length).toBe(0);
+  });
+
+  it("empty state passes with normal rendering tests", () => {
+    render(<EventFeed events={[]} loading={false} />);
+    expect(screen.getByText("No recent events found.")).toBeDefined();
+
+    render(<EventFeed events={mockEvents} loading={false} />);
+    expect(screen.getByText("transfer")).toBeDefined();
+    expect(screen.getByText("mint")).toBeDefined();
+  });
 });
