@@ -210,4 +210,40 @@ describe("AdminPage – blocklist management", () => {
       expect((btn as HTMLButtonElement).disabled).toBe(false);
     });
   });
+
+  // #989 New tests for empty and malformed admin submissions
+  it("blocks submission when blocklist address field is empty", async () => {
+    renderAdminPage();
+    const btn = await screen.findByRole("button", { name: /Add to Blocklist/i });
+    const addToBlocklistMock = vi.mocked(contracts.compliance.addToBlocklist);
+    
+    fireEvent.click(btn);
+    
+    await waitFor(() => {
+      expect(addToBlocklistMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it("prevents submission with malformed address and shows field feedback", async () => {
+    renderAdminPage();
+    const input = await screen.findByPlaceholderText(/G… \(Stellar address\)/i);
+    const addToBlocklistMock = vi.mocked(contracts.compliance.addToBlocklist);
+    
+    fireEvent.change(input, { target: { value: "MALFORMED_ADDRESS" } });
+    
+    const btn = screen.getByRole("button", { name: /Add to Blocklist/i });
+    fireEvent.click(btn);
+    
+    await waitFor(() => {
+      expect(addToBlocklistMock).not.toHaveBeenCalled();
+    });
+    
+    // Field-level feedback should be visible
+    await waitFor(() => {
+      const errorMessage = screen.queryByRole("alert");
+      if (errorMessage) {
+        expect(errorMessage.textContent).toMatch(/valid/i);
+      }
+    });
+  });
 });

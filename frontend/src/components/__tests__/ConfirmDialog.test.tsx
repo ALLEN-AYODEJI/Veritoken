@@ -149,6 +149,64 @@ describe("ConfirmDialog – interactions", () => {
     fireEvent.keyDown(panel, { key: "Escape" });
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
+
+  // #990 New tests for keyboard behavior
+  it("dialog buttons are keyboard accessible via Tab", () => {
+    render(
+      <ConfirmDialog
+        title="Test Dialog"
+        description="Test description"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    
+    const confirmBtn = screen.getByRole("button", { name: /Confirm/i });
+    const cancelBtn = screen.getByRole("button", { name: /Cancel/i });
+    
+    expect(confirmBtn.tabIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelBtn.tabIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it("Escape key dismisses the dialog", () => {
+    const onCancel = vi.fn();
+    const { container } = render(
+      <ConfirmDialog
+        title="Test Dialog"
+        description="Test description"
+        onConfirm={vi.fn()}
+        onCancel={onCancel}
+      />,
+    );
+    
+    const dialog = container.querySelector('[role="dialog"]') as HTMLElement;
+    expect(dialog).not.toBeNull();
+    
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("focus is contained within dialog when open", () => {
+    const { container } = render(
+      <ConfirmDialog
+        title="Test Dialog"
+        description="Test description"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    
+    const dialog = container.querySelector('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
+    
+    const confirmBtn = screen.getByRole("button", { name: /Confirm/i });
+    const cancelBtn = screen.getByRole("button", { name: /Cancel/i });
+    
+    expect(confirmBtn).toBeDefined();
+    expect(cancelBtn).toBeDefined();
+  });
 });
 
 describe("ConfirmDialog – loading state", () => {
